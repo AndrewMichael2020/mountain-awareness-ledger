@@ -4,17 +4,33 @@ jurisdictions:
   AB:
     tokens: ["Alberta", "AB", "Banff", "Jasper", "Kananaskis", "Canmore", "Rockies", "Peter Lougheed Provincial Park", "K-Country"]
   WA:
-    tokens: ["Washington State", "WA", "North Cascades", "Mount Rainier", "Rainier", "Mount Baker", "Baker"]
+    tokens: ["Washington", "Washington State", "WA", "North Cascades", "Mount Rainier", "Rainier", "Mount Baker", "Baker", "Snohomish County", "Del Campo", "Del Campo Peak", "Monte Cristo"]
 
 activities:
-  alpinism: ["climber", "mountaineer", "alpinist"]
-  climbing: ["climber", "climbing", "rock climbing", "ice climber", "ice climbing"]
-  hiking: ["hiker", "hiking", "scrambler", "scrambling"]
-  ski-mountaineering: ["skier", "snowboarder", "backcountry", "ski mountaineer", "ski touring"]
+  alpinism: ["climber", "mountaineer", "alpinist", "mountaineering"]
+  climbing: ["climber", "climbing", "rock climber", "rock climbing", "ice climber", "ice climbing", "mixed climbing"]
+  hiking: ["hiker", "hiking", "backpacker", "trekker", "trekking"]
+  scrambling: ["scrambler", "scrambling"]
+  ski-mountaineering: [
+    "skier",
+    "snowboarder",
+    "backcountry",
+    "backcountry skiing",
+    "backcountry snowboarding",
+    "ski mountaineer",
+    "ski touring",
+    "ski tourer",
+    "alpine touring",
+    "AT skier",
+    "splitboarder",
+    "splitboarding",
+    "skimo"
+  ]
 
 fatality_triggers:
   - death
   - died
+  - dies
   - fatal
   - fatality
   - perished
@@ -24,23 +40,245 @@ fatality_triggers:
   - "pronounced dead"
   - "recovery operation"
   - "body recovered"
+  - "not recovered"
 
 allowlist_sites:
-  - vancouversun.com
-  - cbc.ca
-  - globalnews.ca
-  - squamishchief.com
-  - castanet.net
-  - coastreporter.net
-  - gripped.com
-  - avalanche.ca
-  - alpinist.com
-  - parkscanada.gc.ca
-  - news.gov.bc.ca
-  - mountaineers.org
-  - fs.usda.gov
-  - nps.gov
-  - calgary.ctvnews.ca
-  - edmonton.ctvnews.ca
-  - calgaryherald.com
-  - calgarysun.com
+  - domain: climbing.com
+    region: global
+    sections:
+      - /news/
+      - /people/
+      - /stories/
+    rss:
+      - https://www.climbing.com/feed/
+
+  - domain: squamishchief.com
+    region: BC
+    sections:
+      - /local-news/
+      - /search-and-rescue/
+    rss:
+      - https://www.squamishchief.com/rss
+
+  - domain: fox13seattle.com
+    region: WA
+    sections:
+      - /news/local/
+      - /explore-washington/
+    rss: []
+
+  - domain: seattletimes.com
+    region: WA
+    sections:
+      - /life/outdoors/
+      - /sports/outdoors/
+    rss:
+      - https://www.seattletimes.com/life/outdoors/feed/
+
+  - domain: king5.com
+    region: WA
+    sections:
+      - /outdoors/
+      - /local/
+    rss: []
+
+  - domain: komonews.com
+    region: WA
+    sections:
+      - /news/local/
+      - /sports/outdoors/
+    rss: []
+
+  - domain: heraldnet.com
+    region: WA
+    sections:
+      - /news/
+      - /life/outdoors/
+    rss:
+      - https://www.heraldnet.com/feed/
+
+  - domain: bellinghamherald.com
+    region: WA
+    sections:
+      - /news/local/
+      - /news/state/
+    rss:
+      - https://www.bellinghamherald.com/news/local/?widgetName=rssfeed&widgetId=71023&getXmlFeed=true
+
+  - domain: vancouversun.com
+    region: BC
+    sections:
+      - /news/local-news/
+    rss:
+      - https://vancouversun.com/feed/
+
+  - domain: cbc.ca
+    region: BC
+    sections:
+      - /news/canada/british-columbia
+      - /news/canada/calgary
+      - /news/canada/edmonton
+    rss:
+      - https://www.cbc.ca/cmlink/rss-canada-britishcolumbia
+      - https://www.cbc.ca/cmlink/rss-canada-calgary
+      - https://www.cbc.ca/cmlink/rss-canada-edmonton
+
+  - domain: globalnews.ca
+    region: BC
+    sections:
+      - /bc/
+      - /alberta/
+    rss:
+      - https://globalnews.ca/bc/feed/
+      - https://globalnews.ca/alberta/feed/
+
+  - domain: castanet.net
+    region: BC
+    sections:
+      - /news/
+      - /news/BC/
+    rss:
+      - https://www.castanet.net/rss/1
+
+  - domain: coastreporter.net
+    region: BC
+    sections:
+      - /local-news/
+    rss: []
+
+  - domain: gripped.com
+    region: global
+    sections:
+      - /news/
+      - /accidents/
+    rss:
+      - https://gripped.com/feed/
+
+  - domain: avalanche.ca
+    region: CA
+    sections:
+      - /incidents/
+      - /blog/
+    rss:
+      - https://avalanche.ca/api/rss/incidents
+
+  - domain: alpinist.com
+    region: global
+    sections:
+      - /news/
+      - /features/
+    rss:
+      - https://www.alpinist.com/rss/
+
+  - domain: parkscanada.gc.ca
+    region: CA
+    sections:
+      - /media
+      - /public-safety
+    rss: []
+
+  - domain: news.gov.bc.ca
+    region: BC
+    sections:
+      - /releases/
+    rss: []
+
+  - domain: mountaineers.org
+    region: WA
+    sections:
+      - /blog/
+      - /activities/trip-reports/
+    rss: []
+
+  - domain: fs.usda.gov
+    region: US
+    sections:
+      - /recarea/
+      - /alerts-notices
+    rss: []
+
+  - domain: nps.gov
+    region: US
+    sections:
+      - /news/
+      - /learn/news/
+    rss: []
+
+  - domain: calgary.ctvnews.ca
+    region: AB
+    sections:
+      - /local-news/
+    rss:
+      - https://calgary.ctvnews.ca/rss/ctv-news-calgary-1.822419
+
+  - domain: edmonton.ctvnews.ca
+    region: AB
+    sections:
+      - /local-news/
+    rss:
+      - https://edmonton.ctvnews.ca/rss/ctv-news-edmonton-1.822402
+
+  - domain: calgaryherald.com
+    region: AB
+    sections:
+      - /news/local-news/
+    rss:
+      - https://calgaryherald.com/feed/
+
+  - domain: calgarysun.com
+    region: AB
+    sections:
+      - /news/local-news/
+    rss:
+      - https://calgarysun.com/feed/
+
+  - domain: edmontonjournal.com
+    region: AB
+    sections:
+      - /news/local-news/
+    rss:
+      - https://edmontonjournal.com/feed/
+
+  - domain: theprovince.com
+    region: BC
+    sections:
+      - /news/local-news/
+    rss:
+      - https://theprovince.com/feed/
+
+  - domain: mountbakersar.org
+    region: WA
+    sections:
+      - /
+    rss: []
+
+  - domain: northshorerescue.com
+    region: BC
+    sections:
+      - /
+    rss: []
+
+  - domain: squamishsar.org
+    region: BC
+    sections:
+      - /
+    rss: []
+
+  - domain: seattlemountainrescue.org
+    region: WA
+    sections:
+      - /
+    rss: []
+
+  - domain: alpineclubofcanada.ca
+    region: CA
+    sections:
+      - /blogs/
+    rss: []
+
+  - domain: gofundme.com
+    region: global
+    sections:
+      - /f/
+    rss: []
+

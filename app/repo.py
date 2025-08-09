@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, date as date_type
+from datetime import datetime, date as date_type, date
 import uuid
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterable
 import json
+import re
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -75,13 +76,55 @@ def create_source(db: Session, *, event_id: uuid.UUID, url: str,
     return s
 
 
+def _sanitize_place_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return name
+    s = str(name)
+    s = s.replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    # Remove any trailing ", near ..." fragment
+    s = re.sub(r",?\s*near\b.*$", "", s, flags=re.IGNORECASE)
+    s = s.strip(" ,;-")
+    return s or None
+
+
+def _norm_names(val: Any) -> list[str] | None:
+    if val is None:
+        return None
+    out: list[str] = []
+    def _add(s: str):
+        s2 = (s or "").strip()
+        if s2:
+            out.append(s2)
+    if isinstance(val, str):
+        for p in val.replace(";", ",").split(","):
+            _add(p)
+    elif isinstance(val, Iterable):
+        for p in val:
+            if isinstance(p, str):
+                _add(p)
+    return out or None
+
+
 def update_event_fields(db: Session, event_id: uuid.UUID, fields: Dict[str, Any]) -> None:
     """Update event columns with extracted fields; ignore keys not present."""
     updatable = {
         "jurisdiction", "iso_country", "admin_area", "location_name", "peak_name",
         "event_type", "activity", "n_fatalities", "date_event_start", "date_event_end",
         "date_of_death", "cause_primary", "contributing_factors", "phase", "tz_local",
+        "names_all", "names_deceased", "names_relatives", "names_responders", "names_spokespersons", "names_medics",
     }
+    # Sanitize place-like strings
+    fields = dict(fields or {})
+    for key in ("location_name", "peak_name"):
+        if key in fields and isinstance(fields.get(key), str):
+            fields[key] = _sanitize_place_name(fields.get(key))
+
+    # Normalize names
+    for k in ("names_all", "names_deceased", "names_relatives", "names_responders", "names_spokespersons", "names_medics"):
+        if k in fields:
+            fields[k] = _norm_names(fields.get(k))
+
     data = {k: v for k, v in fields.items() if k in updatable and v is not None}
     if not data:
         return
@@ -227,3 +270,23 @@ def get_latest_source_for_event(db: Session, event_id: uuid.UUID) -> Optional[So
 def delete_sar_ops_for_event(db: Session, event_id: uuid.UUID) -> None:
     db.execute(text("DELETE FROM sar_ops WHERE event_id = :event_id"), {"event_id": str(event_id)})
     db.commit()
+
+
+def update_source_metadata(db: Session, source_id: uuid.UUID, *, publisher: Optional[str] = None, article_title: Optional[str] = None, date_published: Optional[date] = None) -> None:
+    from .models import Source
+    s = db.get(Source, source_id)
+    if not s:
+        return
+    changed = False
+    if publisher is not None and publisher != s.publisher:
+        s.publisher = publisher
+        changed = True
+    if article_title is not None and article_title != s.article_title:
+        s.article_title = article_title
+        changed = True
+    if date_published is not None and date_published != s.date_published:
+        s.date_published = date_published
+        changed = True
+    if changed:
+        db.add(s)
+        db.commit()
