@@ -169,8 +169,14 @@ def refine_with_llm(cleaned_text: str, pubmeta: Dict[str, Any], current_event: O
         )
         content = resp.choices[0].message.content
         parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            parsed = _normalize_parsed(parsed)
         # Normalize null arrays to empty lists to satisfy schema and coerce strings to lists
         if isinstance(parsed, dict):
+            # Coerce bad jurisdiction strings to None
+            jur = parsed.get("jurisdiction")
+            if isinstance(jur, str) and jur.strip().lower() in {"", "null", "none", "unknown", "n/a"}:
+                parsed["jurisdiction"] = None
             list_keys = [
                 "contributing_factors",
                 "summary_bullets",
@@ -272,3 +278,121 @@ def merge_event_fields(deterministic: Dict[str, Any], refined: ExtractionPayload
         "sar": [s.model_dump() if hasattr(s, "model_dump") else s for s in (refined.sar or [])],
     }
     return merged
+
+
+from typing import Any, Dict
+
+ALLOWED_JURS = {"BC", "AB", "WA"}
+ALLOWED_ACTIVITIES = {
+    "alpinism",
+    "climbing",
+    "hiking",
+    "scrambling",
+    "ski-mountaineering",
+    "unknown",
+}
+
+_SYN_ACTIVITY = {
+    "heli-skiing": "ski-mountaineering",
+    "heli skiing": "ski-mountaineering",
+    "skiing": "ski-mountaineering",
+    "backcountry skiing": "ski-mountaineering",
+    "bc skiing": "ski-mountaineering",
+    "mountaineering": "alpinism",
+    "alpine climbing": "alpinism",
+    "rock climbing": "climbing",
+    "ice climbing": "climbing",
+    "scramble": "scrambling",
+}
+
+
+def _coerce_activity(val: Any) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        v = val.strip().lower()
+        v = _SYN_ACTIVITY.get(v, v)
+        if v in ALLOWED_ACTIVITIES:
+            return v
+        return "unknown"
+    return None
+
+
+def _normalize_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    # Jurisdiction: drop anything outside allowed
+    jur = parsed.get("jurisdiction")
+    if isinstance(jur, str):
+        ju = jur.strip().upper()
+        if ju not in ALLOWED_JURS:
+            parsed["jurisdiction"] = None
+        else:
+            parsed["jurisdiction"] = ju
+    elif jur is not None:
+        parsed["jurisdiction"] = None
+
+    # Activity: map synonyms, clamp to allowed
+    act = parsed.get("activity")
+    parsed["activity"] = _coerce_activity(act)
+
+    # Evidence: ensure list[dict]
+    ev = parsed.get("evidence") or parsed.get("quoted_evidence")
+    if ev is not None:
+        fixed = []
+        if isinstance(ev, list):
+            for item in ev:
+                if isinstance(item, dict):
+                    fixed.append(item)
+                elif isinstance(item, str):
+                    # Drop freeform strings to avoid schema errors
+                    continue
+        elif isinstance(ev, dict):
+            fixed = [ev]
+        else:
+            fixed = []
+        parsed["evidence"] = fixed
+        # Maintain alias field if model expects quoted_evidence
+        parsed["quoted_evidence"] = fixed
+
+    # Summary bullets: list[str]
+    sb = parsed.get("summary_bullets")
+    if sb is None:
+        parsed["summary_bullets"] = []
+    elif isinstance(sb, str):
+        parsed["summary_bullets"] = [sb.strip()]
+    elif isinstance(sb, list):
+        parsed["summary_bullets"] = [str(x).strip() for x in sb if x is not None]
+    else:
+        parsed["summary_bullets"] = []
+
+    # Names lists: coerce to list[str]
+    for k in (
+        "names_all",
+        "names_deceased",
+        "names_relatives",
+        "names_responders",
+        "names_spokespersons",
+        "names_medics",
+        "contributing_factors",
+    ):
+        val = parsed.get(k)
+        if val is None:
+            parsed[k] = []
+        elif isinstance(val, str):
+            parsed[k] = [val.strip()]
+        elif isinstance(val, list):
+            parsed[k] = [str(x).strip() for x in val if x is not None]
+        else:
+            parsed[k] = []
+
+    # SAR segments: list[dict]
+    sar = parsed.get("sar")
+    if sar is None:
+        parsed["sar"] = []
+    elif isinstance(sar, dict):
+        parsed["sar"] = [sar]
+    elif isinstance(sar, list):
+        parsed["sar"] = [x for x in sar if isinstance(x, dict)]
+    else:
+        parsed["sar"] = []
+
+    return parsed

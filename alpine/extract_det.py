@@ -263,17 +263,15 @@ def _jurisdiction(text: str) -> Tuple[Optional[str], Optional[str], Optional[str
     return None, None, None, None
 
 
-def _sar_segments(text: str, ref_dt: Optional[datetime]) -> List[Dict[str, Any]]:
-    t = text or ""
-    segments: List[Dict[str, Any]] = []
-
+def _sar_segments(text: str, published_dt: datetime | None):
+    segs = []
     # Recovery
     rec_date = (
-        _explicit_date_with_keywords(t, ["recovered", "recovery", "located", "found"], ref_dt)
-        or _date_near(t, ["recovered", "recovery", "located", "found", "bodies"], ref_dt=ref_dt)
+        _explicit_date_with_keywords(text, ["recovered", "recovery", "located", "found"], published_dt)
+        or _date_near(text, ["recovered", "recovery", "located", "found", "bodies"], ref_dt=published_dt)
     )
     if rec_date:
-        segments.append({
+        segs.append({
             "op_type": "recovery",
             "started_at": _to_dt(rec_date),
             "ended_at": None,
@@ -285,9 +283,9 @@ def _sar_segments(text: str, ref_dt: Optional[datetime]) -> List[Dict[str, Any]]
     verbs = ["began", "resumed", "initiated", "launched", "started", "suspended", "paused", "continued"]
     month_day = re.compile(rf"({MONTHS})\s+\d{{1,2}}(?:,\s*(20\d{{2}}))?", re.I)
 
-    for m in re.finditer(r"search.{0,100}", t, flags=re.I):
+    for m in re.finditer(r"search.{0,100}", text, flags=re.I):
         span = m.span()
-        window = t[span[0]: span[1] + 120]
+        window = text[span[0]: span[1] + 120]
         vhit = None
         for v in verbs:
             if v in window.lower():
@@ -301,8 +299,8 @@ def _sar_segments(text: str, ref_dt: Optional[datetime]) -> List[Dict[str, Any]]
                 try:
                     if y:
                         sdate = datetime.strptime(f"{mon} {int(d)}, {int(y)}", "%B %d, %Y").date()
-                    elif ref_dt:
-                        sdate = datetime.strptime(f"{mon} {int(d)}, {ref_dt.year}", "%B %d, %Y").date()
+                    elif published_dt:
+                        sdate = datetime.strptime(f"{mon} {int(d)}, {published_dt.year}", "%B %d, %Y").date()
                 except Exception:
                     sdate = None
             if sdate:
@@ -311,7 +309,7 @@ def _sar_segments(text: str, ref_dt: Optional[datetime]) -> List[Dict[str, Any]]
                     outcome = "suspended"
                 elif vhit in ["resumed", "continued"]:
                     outcome = "resumed"
-                segments.append({
+                segs.append({
                     "op_type": "search",
                     "started_at": _to_dt(sdate),
                     "ended_at": None,
@@ -321,9 +319,9 @@ def _sar_segments(text: str, ref_dt: Optional[datetime]) -> List[Dict[str, Any]]
                 break
 
     # Rescue (optional): "rescued on <date>" / "airlifted"
-    res_date = _explicit_date_with_keywords(t, ["rescued", "airlifted", "evacuated"], ref_dt)
+    res_date = _explicit_date_with_keywords(text, ["rescued", "airlifted", "evacuated"], published_dt)
     if res_date:
-        segments.append({
+        segs.append({
             "op_type": "rescue",
             "started_at": _to_dt(res_date),
             "ended_at": None,
@@ -331,7 +329,28 @@ def _sar_segments(text: str, ref_dt: Optional[datetime]) -> List[Dict[str, Any]]
             "outcome": "rescued",
         })
 
-    return segments
+    for m in re.finditer(r"\b([A-Z][a-z]+)\s+(\d{1,2})(?:,\s*(\d{4}))?\b", text):
+        try:
+            mon, d, y = m.groups()
+            if not y and published_dt:
+                y = str(published_dt.year)
+            if not y:
+                continue
+            try:
+                dt = datetime.strptime(f"{mon} {d}, {y}", "%B %d, %Y")
+            except Exception:
+                continue
+            segs.append({
+                "op_type": "recovery",
+                "started_at": dt,
+                "ended_at": None,
+                "outcome": "recovered",
+                "agency": None,
+                "notes": None,
+            })
+        except Exception:
+            continue
+    return segs
 
 
 def evidence_snippets(text: str) -> Dict[str, str]:
@@ -370,128 +389,9 @@ def evidence_snippets(text: str) -> Dict[str, str]:
 
 
 def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str, Any]:
-    """Deterministic extraction from text with generalized heuristics."""
-    t = text or ""
-    t_lower = t.lower()
+    """Deterministic extraction is limited to pubmeta elsewhere. Delegate enrichment to LLM.
 
-    # Fatalities
-    n_fatalities = None
-    fat_patterns = [
-        r"\b(\w+|\d+)\s+(?:men|women|people|persons|climbers|mountaineers|skiers|hikers)\s+(?:killed|dead|deceased|lost|missing|perished)\b",
-        r"\b(pronounced dead|died|killed)\b.{0,30}\b(\w+|\d+)\b",
-        r"\bbodies?\b.{0,10}\b(\w+|\d+)\b",
-        r"\b(\w+|\d+)\s+(?:bodies|victims|fatalities)\b",
-    ]
-    for pat in fat_patterns:
-        m = re.search(pat, t_lower)
-        if m:
-            n = _num_from_words_or_digits(m.group(m.lastindex or 1))
-            if n:
-                n_fatalities = n
-                break
-
-    # Activity
-    activity = None
-    for label, keys in ACTIVITY_MAP:
-        if any(k in t_lower for k in keys):
-            activity = label
-            break
-
-    # Cause
-    cause_primary = None
-    for label, keys in CAUSE_MAP:
-        if any(k in t_lower for k in keys):
-            cause_primary = label
-            break
-
-    # Location & jurisdiction
-    peak_name, location_name = _extract_location(t)
-    jurisdiction, iso_country, admin_area, tz_local = _jurisdiction(t)
-
-    # Phase
-    phase = _phase_from_text(t_lower)
-
-    # Contributing factors
-    contributing_factors: List[str] = []
-    if "cornice" in t_lower:
-        contributing_factors.append("cornices (typical)")
-    if any(w in t_lower for w in ["warming", "spring snowmelt", "spring conditions", "heat wave"]):
-        contributing_factors.append("spring snowmelt/warming")
-    if any(w in t_lower for w in ["steep", "steep terrain", "steep faces", "volcanic", "icefall", "serac"]):
-        contributing_factors.append("steep/technical terrain")
-
-    # Dates
-    event_date = _date_near(t, ["avalanche", "disappeared", "descent", "missing", "failed to return", "last seen", "accident"], ref_dt=published_dt) or _first_date(t, ref_dt=published_dt)
-    recovery_date = (
-        _explicit_date_with_keywords(t, ["recovered", "recovery", "bodies", "located", "found"], published_dt)
-        or _date_near(t, ["recovered", "recovery", "bodies", "located", "found"], ref_dt=published_dt)
-        or None
-    )
-    date_of_death = event_date
-    date_event_start = event_date
-    date_event_end = event_date
-
-    time_to_recovery_days = None
-    if event_date and recovery_date:
-        try:
-            delta = (recovery_date - event_date).days
-            if delta >= 0:
-                time_to_recovery_days = delta
-        except Exception:
-            pass
-
-    # Agencies (generic signals)
-    agencies_found: List[str] = []
-    if any(x in t_lower for x in ["search and rescue", " sar ", " s.a.r "]):
-        agencies_found.append("Search and Rescue")
-    if any(x in t_lower for x in ["rcmp", "police", "sheriff", "state patrol", "mounties", "park rangers", "nps"]):
-        agencies_found.append("Law/Agency")
-    multi_agency = len(agencies_found) >= 2
-
-    # Event type
-    event_type = "fatality" if (n_fatalities and n_fatalities > 0) or ("bodies" in t_lower and "recovered" in t_lower) else None
-
-    # Summary bullets
-    bullets = []
-    if n_fatalities is not None:
-        bullets.append(f"Fatalities: {n_fatalities}")
-    if cause_primary:
-        bullets.append(f"Cause: {cause_primary}")
-    if activity:
-        bullets.append(f"Activity: {activity}")
-    if published_dt:
-        bullets.append(f"Published: {published_dt.date().isoformat()}")
-    if event_date:
-        bullets.append(f"Event date: {event_date.isoformat()}")
-    if recovery_date:
-        bullets.append(f"Recovery date: {recovery_date.isoformat()}")
-
-    sar = _sar_segments(t, published_dt)
-
-    # Evidence snippets for quick provenance
-    quotes = evidence_snippets(t)
-
-    return {
-        "jurisdiction": jurisdiction,
-        "iso_country": iso_country,
-        "admin_area": admin_area,
-        "location_name": location_name,
-        "peak_name": peak_name,
-        "event_type": event_type,
-        "activity": activity,
-        "n_fatalities": n_fatalities,
-        "date_event_start": event_date,
-        "date_event_end": event_date,
-        "date_of_death": date_of_death,
-        "date_recovery": recovery_date,
-        "cause_primary": cause_primary,
-        "contributing_factors": contributing_factors or None,
-        "phase": phase,
-        "tz_local": tz_local,
-        "agencies_found": agencies_found or None,
-        "multi_agency": multi_agency,
-        "time_to_recovery_days": time_to_recovery_days,
-        "summary_bullets": bullets,
-        "sar": sar,
-        "quoted_evidence": quotes or None,
-    }
+    Returning an empty dict prevents heuristic field writes during ingest; the LLM
+    augmentation flow will populate fields like activity, cause, dates, names, SAR, etc.
+    """
+    return {}

@@ -7,6 +7,7 @@ import json
 import itertools
 import logging
 from datetime import date, timedelta
+import time
 
 import yaml
 import requests
@@ -195,16 +196,27 @@ def tavily_search(
         payload["api_key"] = api_key
 
     logger.info("tavily_http: POST %s auth_style=%s payload_keys=%s", url, auth_style, list(payload.keys()))
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
-        if r.status_code != 200:
-            body = r.text[:300].replace("\n", " ") if hasattr(r, "text") else ""
-            logger.error("tavily_http: status=%s error_body=%s", r.status_code, body)
+    timeout = float(os.environ.get("TAVILY_TIMEOUT", "20"))
+    retries = int(os.environ.get("TAVILY_RETRIES", "2"))
+    backoff = float(os.environ.get("TAVILY_BACKOFF", "2"))
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
+            if r.status_code != 200:
+                body = r.text[:300].replace("\n", " ") if hasattr(r, "text") else ""
+                logger.error("tavily_http: status=%s attempt=%d/%d error_body=%s", r.status_code, attempt + 1, retries + 1, body)
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                    time.sleep(backoff * (attempt + 1))
+                    continue
+                return []
+            data = r.json() if hasattr(r, "json") else {}
+            break
+        except Exception as ex:
+            logger.exception("tavily_http: request failed (attempt %d/%d): %s", attempt + 1, retries + 1, ex)
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
             return []
-        data = r.json() if hasattr(r, "json") else {}
-    except Exception as ex:
-        logger.exception("tavily_http: request failed: %s", ex)
-        return []
 
     items = data.get("results", [])
     logger.info("tavily_http: got %d results", len(items))

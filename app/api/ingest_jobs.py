@@ -1,14 +1,23 @@
 from typing import Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-
-from ..db import get_db
+from pydantic import BaseModel
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
+from sqlalchemy.orm import sessionmaker
+from ..db import engine, get_db
 from ..schemas import IngestRequest, RawIngestRequest, TavilyIngestRequest, BatchIngestRequest
 from ..pipeline.graph import run_ingest_graph_url, run_ingest_graph_raw
 from ..pipeline.discover import SearchParams, run_discovery
 from ..pipeline.graph_discover import run_discover_graph
 
 router = APIRouter()
+
+class IngestUrlJob(BaseModel):
+    url: str
+
+class IngestBatchJob(BaseModel):
+    urls: list[str]
 
 @router.post("/discover")
 def discover(
@@ -53,18 +62,52 @@ def ingest_tavily(payload: TavilyIngestRequest, db: Session = Depends(get_db)):
     return ingest_raw(body, db)
 
 @router.post("/ingest/batch")
-def ingest_batch(payload: BatchIngestRequest, db: Session = Depends(get_db)):
+def ingest_batch(job: IngestBatchJob, db: Session = Depends(get_db)):
     results = []
-    for u in payload.urls:
-        out = run_ingest_graph_url(
-            db,
-            url=str(u),
-            publisher=payload.publisher or None,
-            article_title=payload.article_title or None,
-            pub_date=payload.date_published or None,
-        )
-        results.append({"url": str(u), **out})
-    return {"items": results}
+    errors = []
+
+    LocalSession = sessionmaker(bind=engine)
+    timeout = float(os.environ.get("INGEST_TIMEOUT", "10"))
+    workers = int(os.environ.get("INGEST_WORKERS", "4"))
+
+    def _ingest_one(u: str) -> dict:
+        sess = LocalSession()
+        try:
+            out = run_ingest_graph_url(sess, u)
+            status = out.get("status", "ok") if isinstance(out, dict) else "ok"
+            reason = out.get("reason") if isinstance(out, dict) else None
+            return {"url": u, "status": status, "reason": reason}
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    executor = ThreadPoolExecutor(max_workers=max(1, workers))
+    futures = {executor.submit(_ingest_one, u): u for u in job.urls}
+    try:
+        for fut in as_completed(futures, timeout=timeout):
+            u = futures[fut]
+            try:
+                results.append(fut.result())
+            except Exception as exn:
+                errors.append({"url": u, "error": str(exn)})
+                results.append({"url": u, "status": "error", "reason": str(exn)})
+    except FuturesTimeout:
+        pass
+    finally:
+        for fut, u in futures.items():
+            if not fut.done():
+                results.append({"url": u, "status": "timeout", "reason": f">{int(timeout)}s"})
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    ok_statuses = {"ok", "skipped", "created", "exists"}
+    ok_count = sum(1 for r in results if r.get("status") in ok_statuses)
+    return {"ok": ok_count, "errors": errors, "results": results}
+
+@router.post("/jobs/ingest_batch")
+def jobs_ingest_batch(job: IngestBatchJob, db: Session = Depends(get_db)):
+    return ingest_batch(job, db)
 
 @router.post("/discover/ingest")
 def discover_and_ingest(

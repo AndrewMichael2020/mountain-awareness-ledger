@@ -1,12 +1,16 @@
 from typing import Optional, Literal
-from uuid import UUID
 from datetime import datetime
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, text
+from pydantic import BaseModel
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
+from sqlalchemy.orm import sessionmaker
 
 from ..db import get_db, engine
-from ..models import Event
+from ..models import Event, Base
 from ..repo import (
     get_event_with_sources,
     get_sar_ops,
@@ -23,6 +27,95 @@ from ..pipeline.graph_discover import run_discover_graph
 from ..pipeline.llm_refine import build_llm_context, refine_with_llm, merge_event_fields
 
 router = APIRouter()
+
+def _to_jsonable(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, UUID):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(x) for x in obj]
+    # Fallback to string
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+class IngestUrlRequest(BaseModel):
+    url: str
+
+class IngestBatchRequest(BaseModel):
+    urls: list[str]
+
+@router.post("/ingest/url")
+def ingest_url(req: IngestUrlRequest, db: Session = Depends(get_db)):
+    try:
+        out = run_ingest_graph_url(db, req.url)
+        # Compact summary
+        status = "ok"
+        reason = None
+        if isinstance(out, dict):
+            status = out.get("status", status)
+            reason = out.get("reason")
+        return {"url": req.url, "status": status, "reason": reason}
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail=str(ex))
+
+@router.post("/ingest/batch")
+def ingest_batch(req: IngestBatchRequest, db: Session = Depends(get_db)):
+    results: list[dict] = []
+    errors: list[dict] = []
+
+    # Use independent sessions per task for thread safety
+    LocalSession = sessionmaker(bind=engine)
+    timeout = float(os.environ.get("INGEST_TIMEOUT", "10"))
+    workers = int(os.environ.get("INGEST_WORKERS", "4"))
+
+    def _ingest_one(u: str) -> dict:
+        sess = LocalSession()
+        try:
+            out = run_ingest_graph_url(sess, u)
+            status = "ok"
+            reason = None
+            if isinstance(out, dict):
+                status = out.get("status", status)
+                reason = out.get("reason")
+            return {"url": u, "status": status, "reason": reason}
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    executor = ThreadPoolExecutor(max_workers=max(1, workers))
+    futures = {executor.submit(_ingest_one, u): u for u in req.urls}
+    try:
+        for fut in as_completed(futures, timeout=timeout):
+            u = futures[fut]
+            try:
+                results.append(fut.result())
+            except Exception as exn:
+                err = {"url": u, "error": str(exn)}
+                errors.append(err)
+                results.append({"url": u, "status": "error", "reason": str(exn)})
+    except FuturesTimeout:
+        # Hard timeout reached; mark remaining as timeout and return immediately
+        pass
+    finally:
+        for fut, u in futures.items():
+            if not fut.done():
+                results.append({"url": u, "status": "timeout", "reason": f">{int(timeout)}s"})
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    ok_statuses = {"ok", "skipped", "created", "exists"}
+    ok_count = sum(1 for r in results if r.get("status") in ok_statuses)
+    return {"ok": ok_count, "errors": errors, "results": results}
 
 @router.get("/sar_ops")
 def list_sar_ops(event_id: Optional[str] = Query(None), db: Session = Depends(get_db)):
@@ -374,7 +467,13 @@ def augment_missing(
 
             if not force:
                 # Skip if already has core fields
-                if ev.location_name and ev.n_fatalities is not None and ev.jurisdiction and ev.activity:
+                def missing(v):
+                    if v is None:
+                        return True
+                    if isinstance(v, str) and v.strip().lower() in {"", "unknown", "n/a", "null"}:
+                        return True
+                    return False
+                if not any(missing(x) for x in [ev.location_name, ev.n_fatalities, ev.jurisdiction, ev.activity]):
                     skipped.append({"event_id": str(uid), "reason": "already populated"})
                     continue
 
@@ -437,3 +536,46 @@ def augment_missing(
             errors.append({"event_id": str(uid), "error": str(ex)})
 
     return {"attempted": len(ids), "ok": len(ok), "skipped": len(skipped), "errors": len(errors), "ok_ids": ok, "skipped": skipped, "errors_detail": errors}
+
+def _ensure_sar_ops_table():
+    ddl = text(
+        """
+        CREATE TABLE IF NOT EXISTS sar_ops (
+            sar_id UUID PRIMARY KEY,
+            event_id UUID NOT NULL,
+            agency TEXT NULL,
+            op_type TEXT NOT NULL,
+            started_at TIMESTAMP NULL,
+            ended_at TIMESTAMP NULL,
+            outcome TEXT NULL,
+            notes TEXT NULL,
+            CONSTRAINT sar_ops_event_fk FOREIGN KEY (event_id)
+                REFERENCES events(event_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS ix_sar_ops_event_id ON sar_ops(event_id);
+        """
+    )
+    with engine.connect() as conn:
+        conn.execute(ddl)
+        conn.commit()
+
+def _ensure_events_geom():
+    ddl = text(
+        """
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS geom geography(Point, 4326);
+        CREATE INDEX IF NOT EXISTS ix_events_geom ON events USING GIST (geom);
+        """
+    )
+    with engine.connect() as conn:
+        conn.execute(ddl)
+        conn.commit()
+
+@router.post("/admin/init_db")
+def init_db():
+    try:
+        Base.metadata.create_all(bind=engine)
+        _ensure_sar_ops_table()
+        _ensure_events_geom()
+        return {"status": "ok", "created": True}
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"init_db failed: {ex}")
