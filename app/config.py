@@ -1,26 +1,41 @@
-from functools import lru_cache
+from __future__ import annotations
+
+import os
+from typing import Optional
 from pathlib import Path
-from dotenv import load_dotenv
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Load .env.local first (if exists), then .env
-repo_root = Path(__file__).resolve().parents[1]
-load_dotenv(repo_root / ".env.local", override=True)
-load_dotenv(repo_root / ".env", override=False)
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    load_dotenv = None  # type: ignore
 
 
-class Settings(BaseSettings):
-    OPENAI_API_KEY: str | None = None
-    TAVILY_API_KEY: str | None = None
-    DATABASE_URL: str
-    GCP_PROJECT_ID: str | None = None
-    GCP_SQL_INSTANCE: str | None = None  # e.g., project:region:instance
-    GCP_BUCKET: str | None = None
-    ENV: str = "dev"
-
-    model_config = SettingsConfigDict(env_file=None, extra="ignore")
+def _load_env() -> None:
+    root = Path(__file__).resolve().parents[1]
+    if load_dotenv:
+        load_dotenv(dotenv_path=root / ".env", override=False)
+        load_dotenv(dotenv_path=root / ".env.local", override=True)
 
 
-@lru_cache
+# Load at import time
+_load_env()
+
+
+class Settings:
+    def __init__(self) -> None:
+        self.DATABASE_URL = os.getenv(
+            "DATABASE_URL",
+            "postgresql+psycopg2://postgres:postgres@localhost:5432/alpine_ledger",
+        )
+        self.ENV = os.getenv("ENV", "dev")
+        self.DATA_DIR = os.getenv("DATA_DIR", str(Path.cwd() / "data"))
+        self.TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_tavily_api_key() -> Optional[str]:
+    return os.getenv("TAVILY_API_KEY")

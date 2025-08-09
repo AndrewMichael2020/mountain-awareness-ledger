@@ -1,0 +1,46 @@
+jurisdictions:
+  BC:
+    tokens: ["British Columbia", "BC", "Coast Mountains", "Squamish", "Whistler", "Garibaldi"]
+  AB:
+    tokens: ["Alberta", "AB", "Banff", "Jasper", "Kananaskis", "Canmore", "Rockies", "Peter Lougheed Provincial Park", "K-Country"]
+  WA:
+    tokens: ["Washington State", "WA", "North Cascades", "Mount Rainier", "Rainier", "Mount Baker", "Baker"]
+
+activities:
+  alpinism: ["climber", "mountaineer", "alpinist"]
+  climbing: ["climber", "climbing", "rock climbing", "ice climber", "ice climbing"]
+  hiking: ["hiker", "hiking", "scrambler", "scrambling"]
+  ski-mountaineering: ["skier", "snowboarder", "backcountry", "ski mountaineer", "ski touring"]
+
+fatality_triggers:
+  - death
+  - died
+  - fatal
+  - fatality
+  - perished
+  - killed
+  - "lost their life"
+  - "found dead"
+  - "pronounced dead"
+  - "recovery operation"
+  - "body recovered"
+
+allowlist_sites:
+  - vancouversun.com
+  - cbc.ca
+  - globalnews.ca
+  - squamishchief.com
+  - castanet.net
+  - coastreporter.net
+  - gripped.com
+  - avalanche.ca
+  - alpinist.com
+  - parkscanada.gc.ca
+  - news.gov.bc.ca
+  - mountaineers.org
+  - fs.usda.gov
+  - nps.gov
+  - calgary.ctvnews.ca
+  - edmonton.ctvnews.ca
+  - calgaryherald.com
+  - calgarysun.com

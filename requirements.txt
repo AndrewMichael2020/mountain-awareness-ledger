@@ -12,9 +12,10 @@ pydantic>=2
 pydantic-settings
 sentence-transformers
 simhash
-langgraph
+langgraph>=0.2.30
+langchain-core>=0.2.39
 shapely
-geopy
+geopy>=2.4.1
 meteostat
 
 # Database
@@ -23,7 +24,7 @@ alembic
 psycopg2-binary
 
 # Environment and utilities
-python-dotenv
+python-dotenv>=1.0.1
 python-multipart
 loguru
 geoalchemy2

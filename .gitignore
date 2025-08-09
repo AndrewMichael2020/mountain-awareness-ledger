@@ -6,6 +6,7 @@
 .langgraph_api/
 
 # Environment and config
+# Local environment
 .env
 .env.*
 !.env.example

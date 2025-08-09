@@ -16,6 +16,47 @@ MONTHS = (
 RE_ISO = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
 RE_LONG = re.compile(rf"\b({MONTHS})\s+(\d{{1,2}})(?:,\s*(20\d{{2}}))?\b", re.I)
 
+# New: generic location patterns
+RE_PEAK = re.compile(r"\b(?:Mount|Mt\.?|Peak|Pinnacle|Butte|Spire|Col|Couloir|Glacier|Pass)\s+([A-Z][A-Za-z\-]+(?:\s+[A-Z][A-Za-z\-]+){0,3})")
+RE_PARK = re.compile(r"\b([A-Z][A-Za-z\-]+(?:\s+[A-Z][A-ZaZh\-]+){0,3})\s+(Provincial|National|State)\s+Park\b")
+RE_PLACE_NEAR = re.compile(r"\b(?:near|in|at|on|above|below|around)\s+([A-Z][A-Za-z\-]+(?:\s+[A-Z][A-Za-z\-]+){0,3})")
+SOCIAL_NOISE = {"Facebook", "Twitter", "X", "Instagram", "YouTube", "Email", "SMS", "Reddit"}
+
+# New: jurisdiction mapping by region cues
+JURIS_CUES = [
+    ("BC", {
+        "tokens": ["british columbia", "b.c.", "garibaldi", "kootenay", "okanagan", "squamish", "whistler", "vancouver"],
+        "iso": "CA", "admin": "British Columbia", "tz": "America/Vancouver"
+    }),
+    ("AB", {
+        "tokens": ["alberta", "banff", "jasper", "kananaskis", "canmore", "calgary", "peter lougheed", "lougheed provincial park"],
+        "iso": "CA", "admin": "Alberta", "tz": "America/Edmonton"
+    }),
+    ("WA", {
+        "tokens": ["washington state", "mt. rainier", "mount rainier", "olympic national park", "north cascades", "seattle", "bellingham", "everett"],
+        "iso": "US", "admin": "Washington", "tz": "America/Los_Angeles"
+    }),
+]
+
+# New: expanded activity and cause vocab
+ACTIVITY_MAP = [
+    ("alpinism", ["mountaineer", "alpinist", "alpinism", "mountaineering", "alpine route"]),
+    ("climbing", ["climbing", "rock climb", "ice climb", "mixed climb", "scramble", "scrambling"]),
+    ("ski-mountaineering", ["backcountry ski", "ski touring", "skied", "splitboard", "skin track", "avalanche terrain"]),
+    ("hiking", ["hike", "hiking", "trail", "trek"]),
+]
+
+CAUSE_MAP = [
+    ("avalanche", ["avalanche", "slab release", "cornice collapse", "loose wet", "storm slab", "wind slab", "serac collapse"]),
+    ("fall", ["fell", "fall", "slipped", "plunged", "tumbled"]),
+    ("rockfall", ["rockfall", "fell rocks", "rock slide", "stonefall"]),
+    ("crevasse", ["crevasse", "snow bridge"]),
+    ("hypothermia", ["hypothermia", "exposure"]),
+    ("drowning", ["drowned", "drowning", "river crossing"]),
+    ("lightning", ["lightning", "struck by lightning"]),
+    ("tree well", ["tree well"]),
+]
+
 
 def _all_dates_with_spans(s: str, ref_dt: Optional[datetime] = None) -> List[Tuple[date, Tuple[int, int]]]:
     res: List[Tuple[date, Tuple[int, int]]] = []
@@ -31,7 +72,6 @@ def _all_dates_with_spans(s: str, ref_dt: Optional[datetime] = None) -> List[Tup
             if y:
                 dt = datetime.strptime(f"{mon} {int(d)}, {int(y)}", "%B %d, %Y").date()
             else:
-                # If no explicit year, prefer the article's published year when known
                 if ref_dt is not None:
                     yr = ref_dt.year
                     dt = datetime.strptime(f"{mon} {int(d)}, {yr}", "%B %d, %Y").date()
@@ -71,7 +111,7 @@ def _date_near(text: str, keywords: List[str], penalize_published: bool = True, 
             if kw in window:
                 score += 3
         # nearby action words
-        if any(w in window for w in ["avalanche", "descent", "missing", "disappeared", "failed to return", "search", "rescue", "recovered", "recovery", "bodies"]):
+        if any(w in window for w in ["avalanche", "descent", "missing", "disappeared", "failed to return", "search", "rescue", "recovered", "recovery", "bodies", "pronounced dead", "killed", "died"]):
             score += 1
         # penalize published/updated contexts
         if penalize_published and any(w in window for w in ["published", "updated", "posted"]):
@@ -159,21 +199,188 @@ def _num_from_words_or_digits(segment: str) -> Optional[int]:
     return None
 
 
-def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str, Any]:
-    """Deterministic extraction from text with simple heuristics.
+def _to_dt(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day)
 
-    Returns a dict of core fields; tolerant and aims for correct values in common cases.
-    """
+
+def _phase_from_text(t_lower: str) -> Optional[str]:
+    # Broadened phase cues
+    if any(p in t_lower for p in ["on the descent", "on descent", "descending", "descent", "after summiting", "after summit", "heading down", "returning", "on return"]):
+        return "descent"
+    if any(p in t_lower for p in ["on the ascent", "on ascent", "ascending", "ascent", "approach", "en route to", "on the way up", "summit bid"]):
+        return "ascent"
+    if any(p in t_lower for p in ["on the summit", "at the summit", "summiting", "summit day"]):
+        return "summit"
+    return None
+
+
+def _extract_location(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (peak_name, location_name) assembled from peak/park/place phrases."""
+    t = text or ""
+    peak = None
+    park = None
+    near = None
+    m = RE_PEAK.search(t)
+    if m:
+        head = m.group(0)
+        peak = head.strip()
+    mp = RE_PARK.search(t)
+    if mp:
+        park = f"{mp.group(1)} {mp.group(2)} Park"
+    mn = RE_PLACE_NEAR.search(t)
+    if mn:
+        cand = mn.group(1).strip()
+        if cand not in SOCIAL_NOISE:
+            near = cand
+    location_name = None
+    parts: List[str] = []
+    if peak:
+        parts.append(peak)
+    if park:
+        parts.append(park)
+    if near and (peak or park):
+        parts.append(f"near {near}")
+    if parts:
+        location_name = ", ".join(parts)
+    return peak, location_name
+
+
+def _jurisdiction(text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    t = (text or "").lower()
+    best: tuple[int, str, str, str, str] | None = None  # (score, code, iso, admin, tz)
+    for code, meta in JURIS_CUES:
+        score = 0
+        for tok in meta["tokens"]:
+            # count occurrences; multi-word tokens benefit
+            score += t.count(tok)
+        if score > 0:
+            cand = (score, code, meta["iso"], meta["admin"], meta["tz"])
+            if best is None or cand[0] > best[0]:
+                best = cand
+    if best:
+        _, code, iso, admin, tz = best
+        return code, iso, admin, tz
+    return None, None, None, None
+
+
+def _sar_segments(text: str, ref_dt: Optional[datetime]) -> List[Dict[str, Any]]:
+    t = text or ""
+    segments: List[Dict[str, Any]] = []
+
+    # Recovery
+    rec_date = (
+        _explicit_date_with_keywords(t, ["recovered", "recovery", "located", "found"], ref_dt)
+        or _date_near(t, ["recovered", "recovery", "located", "found", "bodies"], ref_dt=ref_dt)
+    )
+    if rec_date:
+        segments.append({
+            "op_type": "recovery",
+            "started_at": _to_dt(rec_date),
+            "ended_at": None,
+            "agency": None,
+            "outcome": "recovered",
+        })
+
+    # Search began/resumed/suspended
+    verbs = ["began", "resumed", "initiated", "launched", "started", "suspended", "paused", "continued"]
+    month_day = re.compile(rf"({MONTHS})\s+\d{{1,2}}(?:,\s*(20\d{{2}}))?", re.I)
+
+    for m in re.finditer(r"search.{0,100}", t, flags=re.I):
+        span = m.span()
+        window = t[span[0]: span[1] + 120]
+        vhit = None
+        for v in verbs:
+            if v in window.lower():
+                vhit = v
+                break
+        if vhit:
+            md = month_day.search(window)
+            sdate = None
+            if md:
+                mon, d, y = md.groups()
+                try:
+                    if y:
+                        sdate = datetime.strptime(f"{mon} {int(d)}, {int(y)}", "%B %d, %Y").date()
+                    elif ref_dt:
+                        sdate = datetime.strptime(f"{mon} {int(d)}, {ref_dt.year}", "%B %d, %Y").date()
+                except Exception:
+                    sdate = None
+            if sdate:
+                outcome = None
+                if vhit in ["suspended", "paused"]:
+                    outcome = "suspended"
+                elif vhit in ["resumed", "continued"]:
+                    outcome = "resumed"
+                segments.append({
+                    "op_type": "search",
+                    "started_at": _to_dt(sdate),
+                    "ended_at": None,
+                    "agency": None,
+                    "outcome": outcome,
+                })
+                break
+
+    # Rescue (optional): "rescued on <date>" / "airlifted"
+    res_date = _explicit_date_with_keywords(t, ["rescued", "airlifted", "evacuated"], ref_dt)
+    if res_date:
+        segments.append({
+            "op_type": "rescue",
+            "started_at": _to_dt(res_date),
+            "ended_at": None,
+            "agency": None,
+            "outcome": "rescued",
+        })
+
+    return segments
+
+
+def evidence_snippets(text: str) -> Dict[str, str]:
+    """Return short supporting sentences for key fields if present in text."""
+    t = text or ""
+    rules = {
+        "cause_primary": r"(?i)(catastrophic\s+)?avalanche|slab|cornice|rockfall|fell|fall|crevasse|hypothermia",
+        "date_of_death": r"(?i)(on|the (morning|evening) of)\s+[A-Z][a-z]{2,8}\s+\d{1,2}(,\s*\d{4})?",
+        "search_started": r"(?i)(search|rescue)\s+(began|started|launched|initiated|resumed|continued|suspended)",
+        "recovery": r"(?i)(recovered|recovery|located|found)\b",
+    }
+
+    def _sentence_around(idx: int) -> str:
+        start = t.rfind(".", 0, idx)
+        start_q = t.rfind("\n", 0, idx)
+        if start_q > start:
+            start = start_q
+        end = t.find(".", idx)
+        end_n = t.find("\n", idx)
+        if end == -1 or (end_n != -1 and end_n < end):
+            end = end_n
+        if start == -1:
+            start = 0
+        else:
+            start += 1
+        if end == -1:
+            end = len(t)
+        return t[start:end].strip()
+
+    snippets: Dict[str, str] = {}
+    for field, pat in rules.items():
+        m = re.search(pat, t)
+        if m:
+            snippets[field] = _sentence_around(m.start())
+    return snippets
+
+
+def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str, Any]:
+    """Deterministic extraction from text with generalized heuristics."""
     t = text or ""
     t_lower = t.lower()
 
-    # fatalities count heuristics (more robust: includes lost/missing/deceased/bodies)
+    # Fatalities
     n_fatalities = None
     fat_patterns = [
-        r"\b(\w+|\d+)\s+(?:men|people|persons|climbers|mountaineers)\s+(?:killed|dead|deceased|lost|missing)\b",
-        r"\b(recovery|recovered)\b.{0,40}\b(\w+|\d+)\b",
+        r"\b(\w+|\d+)\s+(?:men|women|people|persons|climbers|mountaineers|skiers|hikers)\s+(?:killed|dead|deceased|lost|missing|perished)\b",
+        r"\b(pronounced dead|died|killed)\b.{0,30}\b(\w+|\d+)\b",
         r"\bbodies?\b.{0,10}\b(\w+|\d+)\b",
-        r"\b(\w+|\d+)\s+(?:bodies|victims)\b",
+        r"\b(\w+|\d+)\s+(?:bodies|victims|fatalities)\b",
     ]
     for pat in fat_patterns:
         m = re.search(pat, t_lower)
@@ -183,67 +390,38 @@ def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str
                 n_fatalities = n
                 break
 
-    # activity: prefer alpinism when mountaineer words present
+    # Activity
     activity = None
-    if any(w in t_lower for w in ["mountaineer", "alpinist", "alpinism", "mountaineering"]):
-        activity = "alpinism"
-    else:
-        for key in ["climbing", "hiking", "scrambling", "ski-mountaineering", "skiing"]:
-            if key in t_lower:
-                activity = key
-                break
+    for label, keys in ACTIVITY_MAP:
+        if any(k in t_lower for k in keys):
+            activity = label
+            break
 
-    # cause
+    # Cause
     cause_primary = None
-    for kw, label in [
-        ("avalanche", "avalanche"),
-        ("rockfall", "rockfall"),
-        ("cornice break", "avalanche"),
-        ("fall", "fall"),
-        ("crevasse", "crevasse"),
-        ("hypothermia", "hypothermia"),
-    ]:
-        if kw in t_lower:
+    for label, keys in CAUSE_MAP:
+        if any(k in t_lower for k in keys):
             cause_primary = label
             break
 
-    # location and jurisdiction heuristics
-    peak_name = "Atwell Peak" if "atwell peak" in t_lower else None
-    in_garibaldi = any(x in t_lower for x in ["garibaldi provincial park", "garibaldi park", "garibaldi"]) 
-    near_squamish = "squamish" in t_lower
-    location_name = None
-    if peak_name and (in_garibaldi or near_squamish):
-        parts = [peak_name]
-        if in_garibaldi:
-            parts.append("Garibaldi Provincial Park")
-        if near_squamish:
-            parts.append("near Squamish")
-        location_name = ", ".join(parts)
+    # Location & jurisdiction
+    peak_name, location_name = _extract_location(t)
+    jurisdiction, iso_country, admin_area, tz_local = _jurisdiction(t)
 
-    jurisdiction = None
-    iso_country = None
-    admin_area = None
-    tz_local = None
-    if any(w in t_lower for w in ["british columbia", "squamish", "vancouver sun", "whistler"]):
-        jurisdiction = "BC"
-        iso_country = "CA"
-        admin_area = "British Columbia"
-        tz_local = "America/Vancouver"
+    # Phase
+    phase = _phase_from_text(t_lower)
 
-    # phase
-    phase = "descent" if "descent" in t_lower else None
-
-    # contributing factors
+    # Contributing factors
     contributing_factors: List[str] = []
     if "cornice" in t_lower:
         contributing_factors.append("cornices (typical)")
-    if any(w in t_lower for w in ["warming", "spring snowmelt", "spring conditions"]):
+    if any(w in t_lower for w in ["warming", "spring snowmelt", "spring conditions", "heat wave"]):
         contributing_factors.append("spring snowmelt/warming")
-    if any(w in t_lower for w in ["steep", "steep terrain", "steep faces", "volcanic"]):
-        contributing_factors.append("steep terrain")
+    if any(w in t_lower for w in ["steep", "steep terrain", "steep faces", "volcanic", "icefall", "serac"]):
+        contributing_factors.append("steep/technical terrain")
 
-    # dates: choose event (incident) and recovery using context
-    event_date = _date_near(t, ["avalanche", "disappeared", "descent", "missing", "failed to return", "last seen"], ref_dt=published_dt) or _first_date(t, ref_dt=published_dt)
+    # Dates
+    event_date = _date_near(t, ["avalanche", "disappeared", "descent", "missing", "failed to return", "last seen", "accident"], ref_dt=published_dt) or _first_date(t, ref_dt=published_dt)
     recovery_date = (
         _explicit_date_with_keywords(t, ["recovered", "recovery", "bodies", "located", "found"], published_dt)
         or _date_near(t, ["recovered", "recovery", "bodies", "located", "found"], ref_dt=published_dt)
@@ -253,7 +431,6 @@ def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str
     date_event_start = event_date
     date_event_end = event_date
 
-    # timeline derived field
     time_to_recovery_days = None
     if event_date and recovery_date:
         try:
@@ -263,23 +440,18 @@ def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str
         except Exception:
             pass
 
-    # agencies presence (for multi-agency flag)
-    agencies = [
-        ("Squamish Search and Rescue", ["squamish sar", "squamish search and rescue", "ssar", "b.j. chute"]),
-        ("Whistler SAR", ["whistler sar", "whistler search and rescue"]),
-        ("North Shore Rescue", ["north shore rescue", "nsr", "john blown"]),
-        ("RCMP", ["rcmp", "police"]),
-    ]
+    # Agencies (generic signals)
     agencies_found: List[str] = []
-    for name, kws in agencies:
-        if any(kw in t_lower for kw in kws):
-            agencies_found.append(name)
+    if any(x in t_lower for x in ["search and rescue", " sar ", " s.a.r "]):
+        agencies_found.append("Search and Rescue")
+    if any(x in t_lower for x in ["rcmp", "police", "sheriff", "state patrol", "mounties", "park rangers", "nps"]):
+        agencies_found.append("Law/Agency")
     multi_agency = len(agencies_found) >= 2
 
-    # event type
+    # Event type
     event_type = "fatality" if (n_fatalities and n_fatalities > 0) or ("bodies" in t_lower and "recovered" in t_lower) else None
 
-    # bullets for quick summary
+    # Summary bullets
     bullets = []
     if n_fatalities is not None:
         bullets.append(f"Fatalities: {n_fatalities}")
@@ -293,6 +465,11 @@ def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str
         bullets.append(f"Event date: {event_date.isoformat()}")
     if recovery_date:
         bullets.append(f"Recovery date: {recovery_date.isoformat()}")
+
+    sar = _sar_segments(t, published_dt)
+
+    # Evidence snippets for quick provenance
+    quotes = evidence_snippets(t)
 
     return {
         "jurisdiction": jurisdiction,
@@ -315,4 +492,6 @@ def extract_core_fields(text: str, published_dt: Optional[datetime]) -> Dict[str
         "multi_agency": multi_agency,
         "time_to_recovery_days": time_to_recovery_days,
         "summary_bullets": bullets,
+        "sar": sar,
+        "quoted_evidence": quotes or None,
     }
