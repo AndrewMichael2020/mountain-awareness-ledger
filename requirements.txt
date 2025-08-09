@@ -1,0 +1,29 @@
+# Core web API
+fastapi
+uvicorn
+
+# Networking and parsing
+httpx
+trafilatura
+beautifulsoup4
+
+# Models and validation
+pydantic>=2
+pydantic-settings
+sentence-transformers
+simhash
+langgraph
+shapely
+geopy
+meteostat
+
+# Database
+SQLAlchemy>=2.0
+alembic
+psycopg2-binary
+
+# Environment and utilities
+python-dotenv
+python-multipart
+loguru
+geoalchemy2

@@ -4,3 +4,47 @@
 
 # LangGraph
 .langgraph_api/
+
+# Environment and config
+.env
+.env.*
+!.env.example
+*.envrc
+.python-version
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local data and artifacts
+data/
+samples/
+artifacts/
+logs/
+.cache/
+dist/
+build/
+
+# Alembic/bytecode
+alembic/*.pyc
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Tests/coverage
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Internal docs
+instructions.md
