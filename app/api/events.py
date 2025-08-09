@@ -3,6 +3,7 @@ from uuid import UUID
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from ..db import get_db, engine
 from ..models import Event
@@ -42,7 +43,6 @@ def list_events(
     end_date: Optional[str] = Query(None, description="ISO date upper bound"),
     db: Session = Depends(get_db),
 ):
-    from sqlalchemy import select
     q = select(Event)
     if jurisdiction:
         q = q.where(Event.jurisdiction == jurisdiction)
@@ -339,3 +339,100 @@ def augment_preview(event_id: UUID, multi: bool = Query(True, description="Use a
         "deterministic": deterministic,
         "refined": getattr(refined, "model_dump", lambda: refined.dict())(),
     }
+
+@router.post("/events/augment_missing")
+def augment_missing(
+    jurisdiction: Optional[str] = Query(None, description="Optional jurisdiction filter (BC, AB, WA)"),
+    limit: int = Query(50, ge=1, le=500, description="How many recent events to consider"),
+    force: bool = Query(False, description="Augment regardless of existing fields"),
+    db: Session = Depends(get_db),
+):
+    # Select recent events, optionally filtered
+    q = select(Event.event_id)
+    if jurisdiction:
+        q = q.where(Event.jurisdiction == jurisdiction)
+    ids = [row[0] for row in db.execute(q.order_by(Event.created_at.desc()).limit(limit)).all()]
+
+    ok, skipped, errors = [], [], []
+
+    for uid in ids:
+        try:
+            ev, srcs = get_event_with_sources(db, uid)
+            if not ev:
+                skipped.append({"event_id": str(uid), "reason": "not found"})
+                continue
+            latest = get_latest_source_for_event(db, uid)
+            if not latest or not latest.cleaned_text:
+                skipped.append({"event_id": str(uid), "reason": "no source text"})
+                continue
+
+            if not force:
+                # Skip if already has core fields
+                if ev.location_name and ev.n_fatalities is not None and ev.jurisdiction and ev.activity:
+                    skipped.append({"event_id": str(uid), "reason": "already populated"})
+                    continue
+
+            # Build context with published date
+            if srcs:
+                parts = []
+                for s in srcs:
+                    if not s.cleaned_text:
+                        continue
+                    pub_str = f"Published: {s.date_published.isoformat()}" if getattr(s, "date_published", None) else ""
+                    header = f"Source: {s.publisher or ''} | {s.article_title or ''} | {s.url or ''} {pub_str}".strip()
+                    parts.append(f"{header}\n\n{s.cleaned_text}")
+                combined_text = "\n\n---\n\n".join(parts) if parts else (latest.cleaned_text or "")
+            else:
+                combined_text = latest.cleaned_text or ""
+
+            deterministic = {
+                "jurisdiction": ev.jurisdiction,
+                "location_name": ev.location_name,
+                "peak_name": ev.peak_name,
+                "route_name": getattr(ev, "route_name", None),
+                "activity": ev.activity,
+                "cause_primary": getattr(ev, "cause_primary", None),
+                "contributing_factors": getattr(ev, "contributing_factors", None),
+                "n_fatalities": ev.n_fatalities,
+                "date_event_start": getattr(ev, "date_event_start", None),
+                "date_event_end": getattr(ev, "date_event_end", None),
+                "date_of_death": ev.date_of_death,
+                "names_all": getattr(ev, "names_all", None),
+                "names_deceased": getattr(ev, "names_deceased", None),
+                "names_relatives": getattr(ev, "names_relatives", None),
+                "names_responders": getattr(ev, "names_responders", None),
+                "names_spokespersons": getattr(ev, "names_spokespersons", None),
+                "names_medics": getattr(ev, "names_medics", None),
+            }
+
+            refined = refine_with_llm(combined_text, deterministic)
+            merged = merge_event_fields(deterministic, refined)
+
+            update_event_fields(db, uid, merged)
+
+            if merged.get("summary_bullets") or merged.get("quoted_evidence"):
+                update_source_annotations(
+                    db,
+                    latest.source_id,
+                    quoted_evidence=merged.get("quoted_evidence"),
+                    summary_bullets=merged.get("summary_bullets"),
+                )
+
+            if merged.get("source_publisher") or merged.get("source_title") or merged.get("source_date_published"):
+                update_source_metadata(
+                    db,
+                    latest.source_id,
+                    publisher=merged.get("source_publisher"),
+                    article_title=merged.get("source_title"),
+                    date_published=merged.get("source_date_published"),
+                )
+
+            if merged.get("sar"):
+                delete_sar_ops_for_event(db, uid)
+                insert_sar_segments(db, uid, merged["sar"]) 
+
+            ok.append(str(uid))
+        except Exception as ex:
+            errors.append({"event_id": str(uid), "error": str(ex)})
+
+    return {"attempted": len(ids), "ok": len(ok), "skipped": len(skipped), "errors": len(errors), "ok_ids": ok, "skipped": skipped, "errors_detail": errors}
