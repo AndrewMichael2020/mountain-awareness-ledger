@@ -1,3 +1,133 @@
+# Mountain Awareness Ledger
+
+This service discovers, ingests, and structures mountain-incident reports from the web, then optionally refines fields with an LLM.
+
+Core flow
+- Discover: query the web for candidate articles (URLs)
+- Ingest: fetch, clean, and persist Sources and Events from those URLs
+- Augment (LLM): refine and fill gaps in event fields using model output
+
+Quick start
+1) Prerequisites
+- Dev container: Ubuntu 24.04.2 LTS
+- Docker running a Postgres container named alpine-pg
+- Python deps installed (via the dev container)
+
+2) Environment
+- Copy .env.local template (already present) and set secrets. Minimum:
+  - DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/alpine
+  - TAVILY_API_KEY=... (your key)
+  - OPENAI_API_KEY=... (for LLM steps)
+  - TAVILY_AUTH_STYLE=bearer (recommended for dev keys)
+- Load env in shell
+  set -a && source .env.local && set +a
+
+3) Database
+- Ensure DB and PostGIS exist inside alpine-pg
+  docker exec -it alpine-pg psql -U postgres -c "CREATE DATABASE alpine;"  # ok if exists
+  docker exec -it alpine-pg psql -U postgres -d alpine -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+- Create app tables
+  python -c 'from app.db import engine; from app.models import Base; Base.metadata.create_all(bind=engine); print("Schema created")'
+- Verify
+  docker exec -it alpine-pg psql -U postgres -d alpine -c "\dt public.*"
+
+4) Run API
+- Start FastAPI with your env file
+  uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --env-file .env.local
+- Health
+  curl -s http://127.0.0.1:8000/health | jq
+- Docs
+  $BROWSER http://127.0.0.1:8000/docs
+
+Workflow: Discovery → Ingest → LLM
+Why ingest after discovery?
+- Discovery returns candidate URLs only. Ingest fetches each page, cleans text, extracts baseline fields, and persists a Source linked to an Event. LLM then operates on the persisted text and updates the Event.
+
+A) Discovery
+- Endpoint: POST /discover
+- Params: jurisdiction (BC|AB|WA), years, mode (allowlist|broad|both), strict (bool), max_results_per_query
+- Example
+  curl -s -X POST "http://127.0.0.1:8000/discover?jurisdiction=WA&years=5&mode=broad&strict=false&max_results_per_query=20" | jq
+
+Notes
+- The service builds boolean and NL queries. It filters results by jurisdiction tokens when strict=true.
+- Tavily API auth style is configurable: TAVILY_AUTH_STYLE=header|bearer|body. If header 401s with your key, set bearer.
+- Time range handling: when start/end dates are provided, time_range is omitted per Tavily requirements.
+
+B) Ingest (from discovered URLs)
+- Single: POST /ingest/url
+  Body: {"url":"https://example.com/article"}
+  curl -s -X POST http://127.0.0.1:8000/ingest/url -H "Content-Type: application/json" -d '{"url":"https://example.org/article"}' | jq
+- Batch: POST /ingest/batch
+  Body: {"urls":["https://...","https://..."]}
+  URLS=$(curl -s -X POST "http://127.0.0.1:8000/discover?jurisdiction=WA&years=5&mode=broad&strict=false&max_results_per_query=10" | jq -r '.items[].url' | head -n 5 | jq -Rc 'inputs' | jq -sc '{urls:.}')
+  curl -s -X POST http://127.0.0.1:8000/ingest/batch -H "Content-Type: application/json" -d "$URLS" | jq
+
+After ingest
+- List events
+  curl -s http://127.0.0.1:8000/events | jq
+- Get event details
+  EVENT_ID=$(curl -s http://127.0.0.1:8000/events | jq -r '.items[0].event_id')
+  curl -s http://127.0.0.1:8000/events/$EVENT_ID | jq
+- Get sources (optionally include cleaned text)
+  curl -s "http://127.0.0.1:8000/events/$EVENT_ID/sources?text=false" | jq
+
+C) LLM Augmentation
+- Preview (no DB writes)
+  curl -s -X POST "http://127.0.0.1:8000/events/$EVENT_ID/augment/preview?multi=true" | jq
+- Persist augmentation
+  curl -s -X POST "http://127.0.0.1:8000/events/$EVENT_ID/augment?multi=true" | jq
+- Batch augment recent
+  curl -s -X POST "http://127.0.0.1:8000/events/augment_missing?jurisdiction=WA&limit=50&force=false" | jq
+
+Requirements for LLM steps
+- Set OPENAI_API_KEY in .env.local
+- Optional: OPENAI_MODEL (default gpt-4o-mini)
+
+Relevant endpoints (selected)
+- GET /events – list recent events (with filters)
+- GET /events/{event_id} – detailed event (+ verbose excerpt)
+- GET /events/{event_id}/sources – list sources (+ full text optional)
+- POST /events/{event_id}/reprocess – re-run LLM on an event
+- POST /events/{event_id}/augment – apply LLM augmentation
+- POST /events/{event_id}/augment/preview – dry run
+- POST /events/augment_missing – augment multiple
+- POST /discover – run discovery queries
+- POST /ingest/url – ingest a single URL
+- POST /ingest/batch – ingest many URLs
+
+Tavily tips (manual curl)
+- Use bearer auth if header fails for your key:
+  curl -i -X POST https://api.tavily.com/search \
+    -H "Authorization: Bearer $TAVILY_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"query":"test","max_results":3}'
+- Escape inner quotes in JSON or build with jq:
+  jq -nc --arg q '(died OR dies OR fatal OR killed) AND (Washington OR "Washington State" OR WA)' '{"query":$q,"max_results":5,"search_depth":"advanced","include_answer":false}' | \
+  curl -i -X POST https://api.tavily.com/search -H "Authorization: Bearer $TAVILY_API_KEY" -H "Content-Type: application/json" -d @-
+
+Troubleshooting
+- 401 Unauthorized from Tavily
+  - Try TAVILY_AUTH_STYLE=bearer; reload env; restart API
+  - Validate with curl bearer; rotate key if still failing
+- 400 Invalid time_range from Tavily
+  - Ensure the app omits time_range when using start_date/end_date (fixed)
+- Invalid JSON in curl
+  - Escape quotes or use jq to construct JSON
+- DB missing tables
+  - Run schema creation one-liner and verify with \dt public.*
+- API logs
+  - Run uvicorn in the foreground to see lines like "tavily_http: ..."
+
+Notes
+- .env.local is ignored by git. Do not commit real secrets.
+- Data lives under DATA_DIR (see .env.local).
+
+License
+- See project license if provided.
+
+---
+
 # Alpine Disasters: Agentic Ledger for Fatal Alpine Incidents
 _Last updated: 2025-08-08 23:30 UTC_
 

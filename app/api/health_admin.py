@@ -136,3 +136,62 @@ def export_sources_csv():
               CAST(quoted_evidence AS TEXT) AS quoted_evidence,
               created_at,
               updated_at
+            FROM sources
+            ORDER BY created_at DESC
+            """
+        ))
+        rows = res.fetchall()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    headers = [
+        "source_id",
+        "event_id",
+        "url",
+        "publisher",
+        "article_title",
+        "date_published",
+        "summary_bullets_json",
+        "quoted_evidence_json",
+        "created_at",
+        "updated_at",
+    ]
+    w.writerow(headers)
+    for r in rows:
+        w.writerow(list(r))
+    return Response(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=sources.csv"})
+
+@router.get("/export/sar_ops.csv")
+def export_sar_ops_csv():
+    with engine.connect() as conn:
+        res = conn.execute(text(
+            """
+            SELECT
+              event_id::text,
+              agency,
+              op_type,
+              started_at,
+              ended_at,
+              outcome,
+              created_at,
+              updated_at
+            FROM sar_ops
+            ORDER BY created_at DESC
+            """
+        ))
+        rows = res.fetchall()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    headers = [
+        "event_id",
+        "agency",
+        "op_type",
+        "started_at",
+        "ended_at",
+        "outcome",
+        "created_at",
+        "updated_at",
+    ]
+    w.writerow(headers)
+    for r in rows:
+        w.writerow(list(r))
+    return Response(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=sar_ops.csv"})

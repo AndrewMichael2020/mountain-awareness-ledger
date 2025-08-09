@@ -16,8 +16,10 @@ def discover(
     years: int = Query(10, ge=1, le=50, description="Lookback window in years"),
     activity: Optional[str] = Query(None, description="activity filter: alpinism, climbing, hiking, ski-mountaineering"),
     mode: Literal["broad", "allowlist", "both"] = Query("both", description="Search breadth"),
+    strict: bool = Query(True, description="Filter results strictly to jurisdiction tokens"),
 ):
     params = SearchParams(jurisdiction=jurisdiction, years=years, activity=activity, mode=mode)
+    params.strict = strict
     out = run_discovery(params)
     return {"status": "ok", **out}
 
@@ -71,9 +73,11 @@ def discover_and_ingest(
     activity: Optional[str] = Query(None),
     mode: Literal["broad", "allowlist", "both"] = Query("both"),
     max_urls: int = Query(10, ge=1, le=50),
+    strict: bool = Query(True, description="Filter results strictly to jurisdiction tokens"),
     db: Session = Depends(get_db),
 ):
     params = SearchParams(jurisdiction=jurisdiction, years=years, activity=activity, mode=mode)
+    params.strict = strict
     disc = run_discovery(params)
     urls = [it["url"] for it in disc.get("items", []) if it.get("url")][:max_urls]
     results = []

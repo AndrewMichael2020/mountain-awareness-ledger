@@ -15,14 +15,12 @@ from ..repo import (
     update_source_annotations,
     insert_sar_segments,
     delete_sar_ops_for_event,
-    update_source_metadata,
 )
 from ..pipeline.geocoder import geocode_from_extracted
 from ..pipeline.graph import run_ingest_graph_url
 from ..pipeline.discover import SearchParams, run_discovery
 from ..pipeline.graph_discover import run_discover_graph
-from alpine.extract_det import extract_core_fields
-from ..pipeline.llm_refine import refine_with_llm, merge_event_fields
+from ..pipeline.llm_refine import build_llm_context, refine_with_llm, merge_event_fields
 
 router = APIRouter()
 
@@ -193,7 +191,7 @@ def reprocess_event(event_id: str, db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid event_id")
 
-    e, _ = get_event_with_sources(db, uid)
+    e, srcs = get_event_with_sources(db, uid)
     if not e:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -201,37 +199,8 @@ def reprocess_event(event_id: str, db: Session = Depends(get_db)):
     if not latest or not latest.cleaned_text:
         raise HTTPException(status_code=400, detail="No source text to process")
 
-    try:
-        pub_dt = None
-        if latest.date_published:
-            pub_dt = datetime.combine(latest.date_published, datetime.min.time())
-
-        extracted = extract_core_fields(latest.cleaned_text, pub_dt)
-        update_event_fields(db, uid, extracted)
-        update_source_annotations(db, latest.source_id, quoted_evidence=extracted.get("quoted_evidence"), summary_bullets=extracted.get("summary_bullets"))
-
-        delete_sar_ops_for_event(db, uid)
-        insert_sar_segments(db, uid, extracted.get("sar") or [])
-
-        hit = geocode_from_extracted(extracted)
-        if hit:
-            from ..repo import set_event_geocode
-            set_event_geocode(db, uid, hit)
-
-        return {"status": "reprocessed", "event_id": event_id}
-    except Exception as ex:
-        raise HTTPException(status_code=500, detail=f"reprocess failed: {ex}")
-
-@router.post("/events/{event_id}/augment")
-def augment_event(event_id: UUID, multi: bool = Query(True, description="Use all sources as context"), db: Session = Depends(get_db)):
-    ev, srcs = get_event_with_sources(db, event_id)
-    if not ev:
-        raise HTTPException(status_code=404, detail="event not found")
-    latest = get_latest_source_for_event(db, event_id)
-    if not latest or not latest.cleaned_text:
-        raise HTTPException(status_code=404, detail="no source text to augment")
-
-    if multi and srcs:
+    # Use LLM augment flow instead of deterministic extraction
+    if srcs:
         parts = []
         for s in srcs:
             if not s.cleaned_text:
@@ -243,14 +212,69 @@ def augment_event(event_id: UUID, multi: bool = Query(True, description="Use all
     else:
         combined_text = latest.cleaned_text or ""
 
-    deterministic = {
+    combined_text, pubmeta = build_llm_context(srcs or [latest], multi=True)
+
+    refined = refine_with_llm(combined_text, pubmeta, current_event={
+        "jurisdiction": e.jurisdiction,
+        "location_name": e.location_name,
+        "peak_name": e.peak_name,
+        "route_name": getattr(e, "route_name", None),
+        "activity": e.activity,
+        "cause_primary": getattr(e, "cause_primary", None),
+        "contributing_factors": getattr(e, "contributing_factors", None),
+        "n_fatalities": e.n_fatalities,
+        "n_injured": getattr(e, "n_injured", None),
+        "party_size": getattr(e, "party_size", None),
+        "date_event_start": getattr(e, "date_event_start", None),
+        "date_event_end": getattr(e, "date_event_end", None),
+        "date_of_death": e.date_of_death,
+        "names_all": getattr(e, "names_all", None),
+        "names_deceased": getattr(e, "names_deceased", None),
+        "names_relatives": getattr(e, "names_relatives", None),
+        "names_responders": getattr(e, "names_responders", None),
+        "names_spokespersons": getattr(e, "names_spokespersons", None),
+        "names_medics": getattr(e, "names_medics", None),
+    })
+    merged = merge_event_fields({}, refined)
+
+    update_event_fields(db, uid, merged)
+
+    if merged.get("summary_bullets") or merged.get("quoted_evidence"):
+        update_source_annotations(
+            db,
+            latest.source_id,
+            quoted_evidence=merged.get("quoted_evidence"),
+            summary_bullets=merged.get("summary_bullets"),
+        )
+
+    if merged.get("sar"):
+        delete_sar_ops_for_event(db, uid)
+        insert_sar_segments(db, uid, merged["sar"]) 
+
+    return {"status": "reprocessed_via_llm", "event_id": event_id}
+
+@router.post("/events/{event_id}/augment")
+def augment_event(event_id: UUID, multi: bool = Query(True, description="Use all sources as context"), db: Session = Depends(get_db)):
+    ev, srcs = get_event_with_sources(db, event_id)
+    if not ev:
+        raise HTTPException(status_code=404, detail="event not found")
+    latest = get_latest_source_for_event(db, event_id)
+    if not latest or not latest.cleaned_text:
+        raise HTTPException(status_code=404, detail="no source text to augment")
+
+    combined_text, pubmeta = build_llm_context(srcs or [latest], multi=multi)
+
+    refined = refine_with_llm(combined_text, pubmeta, current_event={
         "jurisdiction": ev.jurisdiction,
         "location_name": ev.location_name,
         "peak_name": ev.peak_name,
+        "route_name": getattr(ev, "route_name", None),
         "activity": ev.activity,
         "cause_primary": getattr(ev, "cause_primary", None),
         "contributing_factors": getattr(ev, "contributing_factors", None),
         "n_fatalities": ev.n_fatalities,
+        "n_injured": getattr(ev, "n_injured", None),
+        "party_size": getattr(ev, "party_size", None),
         "date_event_start": getattr(ev, "date_event_start", None),
         "date_event_end": getattr(ev, "date_event_end", None),
         "date_of_death": ev.date_of_death,
@@ -260,10 +284,8 @@ def augment_event(event_id: UUID, multi: bool = Query(True, description="Use all
         "names_responders": getattr(ev, "names_responders", None),
         "names_spokespersons": getattr(ev, "names_spokespersons", None),
         "names_medics": getattr(ev, "names_medics", None),
-    }
-
-    refined = refine_with_llm(combined_text, deterministic)
-    merged = merge_event_fields(deterministic, refined)
+    })
+    merged = merge_event_fields({}, refined)
 
     update_event_fields(db, event_id, merged)
 
@@ -275,14 +297,7 @@ def augment_event(event_id: UUID, multi: bool = Query(True, description="Use all
             summary_bullets=merged.get("summary_bullets"),
         )
 
-    if merged.get("source_publisher") or merged.get("source_title") or merged.get("source_date_published"):
-        update_source_metadata(
-            db,
-            latest.source_id,
-            publisher=merged.get("source_publisher"),
-            article_title=merged.get("source_title"),
-            date_published=merged.get("source_date_published"),
-        )
+    # Do not override publication metadata here; ingest is source of truth
 
     if merged.get("sar"):
         delete_sar_ops_for_event(db, event_id)
@@ -299,26 +314,19 @@ def augment_preview(event_id: UUID, multi: bool = Query(True, description="Use a
     if not latest or not latest.cleaned_text:
         raise HTTPException(status_code=404, detail="no source text to augment")
 
-    if multi and srcs:
-        parts = []
-        for s in srcs:
-            if not s.cleaned_text:
-                continue
-            pub_str = f"Published: {s.date_published.isoformat()}" if getattr(s, "date_published", None) else ""
-            header = f"Source: {s.publisher or ''} | {s.article_title or ''} | {s.url or ''} {pub_str}".strip()
-            parts.append(f"{header}\n\n{s.cleaned_text}")
-        combined_text = "\n\n---\n\n".join(parts) if parts else (latest.cleaned_text or "")
-    else:
-        combined_text = latest.cleaned_text or ""
+    combined_text, pubmeta = build_llm_context(srcs or [latest], multi=multi)
 
-    deterministic = {
+    refined = refine_with_llm(combined_text, pubmeta, current_event={
         "jurisdiction": ev.jurisdiction,
         "location_name": ev.location_name,
         "peak_name": ev.peak_name,
+        "route_name": getattr(ev, "route_name", None),
         "activity": ev.activity,
         "cause_primary": getattr(ev, "cause_primary", None),
         "contributing_factors": getattr(ev, "contributing_factors", None),
         "n_fatalities": ev.n_fatalities,
+        "n_injured": getattr(ev, "n_injured", None),
+        "party_size": getattr(ev, "party_size", None),
         "date_event_start": getattr(ev, "date_event_start", None),
         "date_event_end": getattr(ev, "date_event_end", None),
         "date_of_death": ev.date_of_death,
@@ -328,15 +336,13 @@ def augment_preview(event_id: UUID, multi: bool = Query(True, description="Use a
         "names_responders": getattr(ev, "names_responders", None),
         "names_spokespersons": getattr(ev, "names_spokespersons", None),
         "names_medics": getattr(ev, "names_medics", None),
-    }
-
-    refined = refine_with_llm(combined_text, deterministic)
+    })
 
     return {
         "event_id": str(event_id),
         "sources_count": len(srcs or []),
         "context_len": len(combined_text or ""),
-        "deterministic": deterministic,
+        "pubmeta": pubmeta,
         "refined": getattr(refined, "model_dump", lambda: refined.dict())(),
     }
 
@@ -385,7 +391,9 @@ def augment_missing(
             else:
                 combined_text = latest.cleaned_text or ""
 
-            deterministic = {
+            combined_text, pubmeta = build_llm_context(srcs or [latest], multi=True)
+
+            refined = refine_with_llm(combined_text, pubmeta, current_event={
                 "jurisdiction": ev.jurisdiction,
                 "location_name": ev.location_name,
                 "peak_name": ev.peak_name,
@@ -394,6 +402,8 @@ def augment_missing(
                 "cause_primary": getattr(ev, "cause_primary", None),
                 "contributing_factors": getattr(ev, "contributing_factors", None),
                 "n_fatalities": ev.n_fatalities,
+                "n_injured": getattr(ev, "n_injured", None),
+                "party_size": getattr(ev, "party_size", None),
                 "date_event_start": getattr(ev, "date_event_start", None),
                 "date_event_end": getattr(ev, "date_event_end", None),
                 "date_of_death": ev.date_of_death,
@@ -403,10 +413,8 @@ def augment_missing(
                 "names_responders": getattr(ev, "names_responders", None),
                 "names_spokespersons": getattr(ev, "names_spokespersons", None),
                 "names_medics": getattr(ev, "names_medics", None),
-            }
-
-            refined = refine_with_llm(combined_text, deterministic)
-            merged = merge_event_fields(deterministic, refined)
+            })
+            merged = merge_event_fields({}, refined)
 
             update_event_fields(db, uid, merged)
 
@@ -418,14 +426,7 @@ def augment_missing(
                     summary_bullets=merged.get("summary_bullets"),
                 )
 
-            if merged.get("source_publisher") or merged.get("source_title") or merged.get("source_date_published"):
-                update_source_metadata(
-                    db,
-                    latest.source_id,
-                    publisher=merged.get("source_publisher"),
-                    article_title=merged.get("source_title"),
-                    date_published=merged.get("source_date_published"),
-                )
+            # Do not override publication metadata here; ingest is source of truth
 
             if merged.get("sar"):
                 delete_sar_ops_for_event(db, uid)

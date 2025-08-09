@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, List, Literal, Dict, Any
+from typing import Optional, List, Literal, Dict, Any, Tuple
 from datetime import date
 import os
 import re
@@ -75,22 +75,48 @@ class ExtractionPayload(BaseModel):
     date_published: Optional[date] = None
 
 
-def refine_with_llm(cleaned_text: str, deterministic: Dict[str, Any]) -> ExtractionPayload:
-    """Use an LLM to fill gaps and fix obvious errors. If OPENAI_API_KEY missing, return minimal payload."""
+def build_llm_context(srcs: List[Any], multi: bool = True) -> Tuple[str, Dict[str, Any]]:
+    """Build combined context text and publication metadata (from the most relevant source)."""
+    if not srcs:
+        return "", {}
+    # Pick the source with latest date_published, else fallback to the first with text
+    candidate = None
+    for s in sorted(srcs, key=lambda x: getattr(x, "date_published", None) or date.min, reverse=True):
+        if getattr(s, "cleaned_text", None):
+            candidate = s
+            break
+    candidate = candidate or next((s for s in srcs if getattr(s, "cleaned_text", None)), srcs[0])
+
+    pubmeta = {
+        "publisher": getattr(candidate, "publisher", None),
+        "article_title": getattr(candidate, "article_title", None),
+        "date_published": getattr(candidate, "date_published", None),
+        "url": getattr(candidate, "url", None),
+    }
+
+    if multi:
+        parts: List[str] = []
+        for s in srcs:
+            if not getattr(s, "cleaned_text", None):
+                continue
+            pub_str = f"Published: {s.date_published.isoformat()}" if getattr(s, "date_published", None) else ""
+            header = f"Source: {s.publisher or ''} | {s.article_title or ''} | {s.url or ''} {pub_str}".strip()
+            parts.append(f"{header}\n\n{s.cleaned_text}")
+        combined_text = "\n\n---\n\n".join(parts) if parts else (getattr(candidate, "cleaned_text", "") or "")
+    else:
+        combined_text = getattr(candidate, "cleaned_text", "") or ""
+
+    return combined_text, pubmeta
+
+
+def refine_with_llm(cleaned_text: str, pubmeta: Dict[str, Any], current_event: Optional[Dict[str, Any]] = None) -> ExtractionPayload:
+    """Use an LLM to fill gaps and fix obvious errors. Publication metadata is deterministic and provided for context only. current_event holds existing event fields for validation, not fallback."""
     api_key = os.environ.get("OPENAI_API_KEY")
     text_len = len(cleaned_text or "")
     model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     if not api_key or OpenAI is None or not cleaned_text:
         logger.warning("llm_refine: skipping LLM (key=%s, sdk=%s, text_len=%d)", bool(api_key), bool(OpenAI), text_len)
-        return ExtractionPayload(
-            jurisdiction=deterministic.get("jurisdiction"),
-            location_name=_sanitize_place(deterministic.get("location_name")),
-            peak_name=_sanitize_place(deterministic.get("peak_name")),
-            activity=deterministic.get("activity") or "unknown",
-            date_of_death=deterministic.get("date_of_death"),
-            n_fatalities=deterministic.get("n_fatalities"),
-            extraction_conf=0.0,
-        )
+        return ExtractionPayload()
 
     logger.info("llm_refine: invoking model=%s text_len=%d", model_name, text_len)
     client = OpenAI(api_key=api_key)
@@ -105,13 +131,21 @@ def refine_with_llm(cleaned_text: str, deterministic: Dict[str, Any]) -> Extract
     # Clip to ~8000 chars to stay under limits
     passage = cleaned_text[:8000]
 
+    cur_json = json.dumps(current_event or {}, default=str)
+    pub_json = json.dumps(pubmeta or {}, default=str)
+
     prompt = {
         "role": "user",
         "content": (
             "Passage:\n```\n" + passage + "\n```\n\n" +
-            "Deterministic extraction (may be incomplete):\n" + json.dumps(deterministic, default=str) + "\n\n" +
+            "Publication metadata (deterministic, for reference only):\n" + pub_json + "\n\n" +
+            "Current event fields (for validation; correct them if wrong or incomplete):\n" + cur_json + "\n\n" +
             "Instructions:\n"
-            "- Your output will OVERRIDE existing values: if you can improve or correct, do so.\n"
+            "- Output a flat JSON object with the schema keys only (no nested levels beyond required lists/objects like SAR segments).\n"
+            "- Your output will OVERRIDE existing values in the event if you have higher confidence based on the passage.\n"
+            "- Set extraction_conf to a number in [0,1] indicating overall confidence.\n"
+            "- For each evidence quote you provide, append a space and (XX%) showing confidence for that field, e.g., '...sentence.' (87%).\n"
+            "- You may also append (XX%) at the end of each summary_bullets entry.\n"
             "- Correct jurisdiction (BC/AB/WA), location_name, and infer the nearest named peak if present.\n"
             "- If a trail/route name is present (e.g., Pacific Crest Trail), set route_name accordingly.\n"
             "- Prefer the article's Published date year when normalizing event dates if the passage omits a year.\n"
@@ -120,7 +154,6 @@ def refine_with_llm(cleaned_text: str, deterministic: Dict[str, Any]) -> Extract
             "- Provide concise summary_bullets (3-6) and evidence quotes. Include at least one evidence quote for any field you set.\n"
             "- Populate SAR segments if mentioned.\n"
             "- Include categorized names (deceased, relatives, responders, spokespersons, medics).\n"
-            "- Also output publisher and article_title if apparent from the passage or URL.\n"
         ),
     }
 
@@ -189,15 +222,7 @@ def refine_with_llm(cleaned_text: str, deterministic: Dict[str, Any]) -> Extract
         logger.info("llm_refine: parsed payload with keys=%s", list(parsed.keys()))
     except Exception as ex:
         logger.exception("llm_refine: error during LLM call or parse: %s", ex)
-        payload = ExtractionPayload(
-            jurisdiction=deterministic.get("jurisdiction"),
-            location_name=_sanitize_place(deterministic.get("location_name")),
-            peak_name=_sanitize_place(deterministic.get("peak_name")),
-            activity=deterministic.get("activity") or "unknown",
-            date_of_death=deterministic.get("date_of_death"),
-            n_fatalities=deterministic.get("n_fatalities"),
-            extraction_conf=0.0,
-        )
+        payload = ExtractionPayload()
 
     # Final sanitization
     payload.location_name = _sanitize_place(payload.location_name)
@@ -206,33 +231,36 @@ def refine_with_llm(cleaned_text: str, deterministic: Dict[str, Any]) -> Extract
 
 
 def merge_event_fields(deterministic: Dict[str, Any], refined: ExtractionPayload) -> Dict[str, Any]:
-    """Prefer refined values when present; fall back to deterministic; include source overrides."""
+    """Use only LLM-derived values for event fields; keep publication metadata deterministic elsewhere."""
 
-    def prefer_refined(ref_val, det_val, sanitizer=lambda x: x):
+    def only_refined(ref_val, sanitizer=lambda x: x):
         if ref_val is not None and ref_val != "" and ref_val != []:
             return sanitizer(ref_val)
-        return det_val
+        return None
 
     merged: Dict[str, Any] = {
-        "jurisdiction": prefer_refined(refined.jurisdiction, deterministic.get("jurisdiction")),
-        "location_name": prefer_refined(refined.location_name, deterministic.get("location_name"), _sanitize_place),
-        "peak_name": prefer_refined(refined.peak_name, deterministic.get("peak_name"), _sanitize_place),
-        "route_name": prefer_refined(getattr(refined, "route_name", None), deterministic.get("route_name"), _sanitize_place),
-        "activity": prefer_refined(refined.activity, deterministic.get("activity")),
-        "cause_primary": prefer_refined(refined.cause_primary, deterministic.get("cause_primary")),
-        "contributing_factors": prefer_refined(refined.contributing_factors or None, deterministic.get("contributing_factors")),
-        "n_fatalities": prefer_refined(refined.n_fatalities, deterministic.get("n_fatalities")),
-        "date_event_start": prefer_refined(refined.date_event_start, deterministic.get("date_event_start")),
-        "date_event_end": prefer_refined(refined.date_event_end, deterministic.get("date_event_end")),
-        "date_of_death": prefer_refined(refined.date_of_death, deterministic.get("date_of_death")),
+        # core event fields (LLM authoritative)
+        "jurisdiction": only_refined(refined.jurisdiction),
+        "location_name": only_refined(refined.location_name, _sanitize_place),
+        "peak_name": only_refined(refined.peak_name, _sanitize_place),
+        "route_name": only_refined(getattr(refined, "route_name", None), _sanitize_place),
+        "activity": only_refined(refined.activity),
+        "cause_primary": only_refined(refined.cause_primary),
+        "contributing_factors": only_refined(refined.contributing_factors or None) or None,
+        "n_fatalities": only_refined(refined.n_fatalities),
+        "n_injured": only_refined(getattr(refined, "n_injured", None)),
+        "party_size": only_refined(getattr(refined, "party_size", None)),
+        "date_event_start": only_refined(refined.date_event_start),
+        "date_event_end": only_refined(refined.date_event_end),
+        "date_of_death": only_refined(refined.date_of_death),
         # categorized names
-        "names_all": prefer_refined(refined.names_all or None, deterministic.get("names_all")),
-        "names_deceased": prefer_refined(refined.names_deceased or None, deterministic.get("names_deceased")),
-        "names_relatives": prefer_refined(refined.names_relatives or None, deterministic.get("names_relatives")),
-        "names_responders": prefer_refined(refined.names_responders or None, deterministic.get("names_responders")),
-        "names_spokespersons": prefer_refined(refined.names_spokespersons or None, deterministic.get("names_spokespersons")),
-        "names_medics": prefer_refined(refined.names_medics or None, deterministic.get("names_medics")),
-        # source annotations
+        "names_all": only_refined(refined.names_all or None),
+        "names_deceased": only_refined(refined.names_deceased or None),
+        "names_relatives": only_refined(refined.names_relatives or None),
+        "names_responders": only_refined(refined.names_responders or None),
+        "names_spokespersons": only_refined(refined.names_spokespersons or None),
+        "names_medics": only_refined(refined.names_medics or None),
+        # source annotations (kept for audit on sources)
         "summary_bullets": refined.summary_bullets or None,
         "quoted_evidence": {
             "cause_primary": next((e.get("quote") if isinstance(e, dict) else getattr(e, "quote", None) for e in (refined.evidence or []) if (isinstance(e, dict) and e.get("field") == "cause_primary") or (getattr(e, "field", None) == "cause_primary")), None),
@@ -242,9 +270,5 @@ def merge_event_fields(deterministic: Dict[str, Any], refined: ExtractionPayload
         },
         # SAR segments
         "sar": [s.model_dump() if hasattr(s, "model_dump") else s for s in (refined.sar or [])],
-        # source overrides
-        "source_publisher": refined.publisher,
-        "source_title": refined.article_title,
-        "source_date_published": refined.date_published,
     }
     return merged

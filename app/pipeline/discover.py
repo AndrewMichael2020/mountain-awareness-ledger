@@ -25,10 +25,11 @@ logger.setLevel(logging.INFO)
 @dataclass
 class SearchParams:
     jurisdiction: str
-    years: int = 10
-    activity: Optional[str] = None
-    mode: str = "broad"  # "broad", "allowlist", or "both"
-    max_results_per_query: int = 20
+    years: int
+    activity: str | None = None
+    mode: str = "both"
+    max_results_per_query: int | None = None
+    strict: bool = True
 
 
 def _load_yaml() -> Dict[str, Any]:
@@ -128,102 +129,94 @@ def build_queries(params: SearchParams) -> List[str]:
 
 def tavily_search(
     query: str,
+    *,
     days_back: int,
-    max_results: int,
-    include_domains: Optional[List[str]] = None,
-    exclude_domains: Optional[List[str]] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    country: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    key = get_tavily_api_key()
-    if not key:
-        logger.warning("tavily_search: missing API key")
+    max_results: int | None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+) -> list[dict]:
+    api_key = os.environ.get("TAVILY_API_KEY") or os.environ.get("TAVILY_APIKEY") or os.environ.get("TAVILY_KEY")
+    if not api_key:
+        logger.warning("tavily_search: missing TAVILY_API_KEY; returning empty list")
         return []
+    url = os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search")
+    auth_style = os.environ.get("TAVILY_AUTH_STYLE", "header").lower()  # header | bearer | body
 
-    time_range = _time_range_from_years(max(1, days_back // 365))
+    # Normalize max_results (Tavily caps at 20)
+    try:
+        mr = int(max_results) if max_results is not None else 10
+    except Exception:
+        mr = 10
+    mr = max(1, min(mr, 20))
 
-    if TavilyClient is not None:
-        try:
-            client = TavilyClient(key)
-            logger.info("tavily_client: depth=advanced tr=%s include_domains=%s max=%d", time_range, bool(include_domains), max_results)
-            kwargs = dict(
-                query=query,
-                topic="news",
-                search_depth="advanced",
-                include_answer="advanced",
-                include_raw_content="text",
-                include_domains=include_domains or None,
-                exclude_domains=exclude_domains or None,
-                max_results=max(1, min(max_results, 20)),
-                start_date=start_date,
-                end_date=end_date,
-                country=country,
-            )
-            if not (start_date or end_date):
-                kwargs["time_range"] = time_range
-            resp = client.search(**kwargs)
-            items = resp.get("results", []) if isinstance(resp, dict) else []
-            logger.info("tavily_client: got %d results", len(items))
-            return [
-                {
-                    "url": item.get("url"),
-                    "title": item.get("title"),
-                    "content": item.get("content"),
-                    "published_date": item.get("published_date"),
-                }
-                for item in items
-            ]
-        except Exception as ex:
-            logger.exception("tavily_client error: %s", ex)
-            # fall through to HTTP
+    # Choose time_range; if explicit start/end present, omit time_range and use custom dates
+    time_range = None
+    if start_date and end_date:
+        time_range = "custom"
+    else:
+        if days_back >= 365:
+            time_range = "year"
+        elif days_back >= 30:
+            time_range = "month"
+        elif days_back >= 7:
+            time_range = "week"
+        else:
+            time_range = "day"
 
-    # HTTP fallback
-    url = "https://api.tavily.com/search"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
-    payload: Dict[str, Any] = {
+    payload = {
         "query": query,
-        "topic": "news",
         "search_depth": "advanced",
+        "max_results": mr,
         "include_answer": "advanced",
         "include_raw_content": "text",
-        "max_results": max(1, min(max_results, 20)),
     }
-    if not (start_date or end_date):
-        payload["time_range"] = time_range
+    if country:
+        payload["country"] = country
     if include_domains:
         payload["include_domains"] = include_domains
     if exclude_domains:
         payload["exclude_domains"] = exclude_domains
-    if start_date:
+
+    if time_range == "custom":
         payload["start_date"] = start_date
-    if end_date:
         payload["end_date"] = end_date
-    if country:
-        payload["country"] = country
+    else:
+        payload["time_range"] = time_range
+
+    headers = {"Content-Type": "application/json"}
+    if auth_style == "bearer":
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif auth_style == "header":
+        headers["x-api-key"] = api_key
+    elif auth_style == "body":
+        payload["api_key"] = api_key
+
+    logger.info("tavily_http: POST %s auth_style=%s payload_keys=%s", url, auth_style, list(payload.keys()))
     try:
-        logger.info("tavily_http: POST %s payload_keys=%s", url, list(payload.keys()))
         r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
-        logger.info("tavily_http: status=%s", r.status_code)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("results", [])
-        logger.info("tavily_http: got %d results", len(items))
-        return [
-            {
-                "url": item.get("url"),
-                "title": item.get("title"),
-                "content": item.get("content"),
-                "published_date": item.get("published_date"),
-            }
-            for item in items
-        ]
+        if r.status_code != 200:
+            body = r.text[:300].replace("\n", " ") if hasattr(r, "text") else ""
+            logger.error("tavily_http: status=%s error_body=%s", r.status_code, body)
+            return []
+        data = r.json() if hasattr(r, "json") else {}
     except Exception as ex:
-        try:
-            logger.error("tavily_http error: %s body=%s", ex, r.text if 'r' in locals() else None)
-        except Exception:
-            logger.error("tavily_http error: %s", ex)
+        logger.exception("tavily_http: request failed: %s", ex)
         return []
+
+    items = data.get("results", [])
+    logger.info("tavily_http: got %d results", len(items))
+    return [
+        {
+            "url": item.get("url"),
+            "title": item.get("title"),
+            "content": item.get("content"),
+            "published_date": item.get("published_date"),
+        }
+        for item in items
+    ]
 
 
 def _dedupe(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -238,7 +231,52 @@ def _dedupe(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def run_discovery(params: SearchParams) -> Dict[str, Any]:
+def _config_path() -> str:
+    here = os.path.dirname(__file__)
+    return os.path.normpath(os.path.join(here, "../../config/search.yml"))
+
+
+# Built-in jurisdiction tokens used when config/search.yml omits them
+_DEFAULT_JUR_TOKENS: dict[str, list[str]] = {
+    "BC": [
+        "british columbia", "bc", "coast mountains", "squamish", "whistler", "garibaldi",
+        "vancouver", "north vancouver", "west vancouver", "north shore", "north shore mountains",
+        "grouse mountain", "cypress mountain", "mount seymour", "sea to sky", "pemberton",
+        "lions bay", "howe sound", "golden ears", "chilliwack", "fraser valley", "coquihalla",
+        "manning park", "sunshine coast",
+    ],
+    "AB": [
+        "alberta", "ab", "banff", "jasper", "kananaskis", "canmore", "rockies",
+        "peter lougheed provincial park", "k-country", "calgary", "edmonton", "lake louise",
+        "bow valley", "spray valley", "highway 40", "yamnuska", "mount yamanuska", "ghost",
+        "waterton", "castle mountain", "crowsnest pass",
+    ],
+    "WA": [
+        "washington", "washington state", "wa", "north cascades", "mount rainier", "rainier",
+        "mount baker", "baker", "snohomish county", "del campo", "del campo peak", "monte christo",
+    ],
+}
+
+
+def _jurisdiction_tokens(jur: str) -> list[str]:
+    try:
+        with open(_config_path(), "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        toks = cfg.get("jurisdictions", {}).get(jur, {}).get("tokens", []) or []
+        toks = [t.lower() for t in toks]
+        if toks:
+            return toks
+    except Exception:
+        pass
+    return _DEFAULT_JUR_TOKENS.get(jur, [])
+
+
+def _matches_tokens(title: str | None, content: str | None, url: str | None, tokens: list[str]) -> bool:
+    blob = " ".join([s or "" for s in (title, content, url)]).lower()
+    return any(tok in blob for tok in tokens) if tokens else True
+
+
+def run_discovery(params: SearchParams) -> dict:
     cfg = _load_yaml()
     queries = build_queries(params)
     days_back = params.years * 365
@@ -272,4 +310,13 @@ def run_discovery(params: SearchParams) -> Dict[str, Any]:
 
     results = _dedupe(results)
     logger.info("discovery.total_results=%d", len(results))
-    return {"queries": queries, "items": results}
+    out = {"queries": queries, "items": results}
+    items = out.get("items", []) or []
+    if params.strict:
+        toks = _jurisdiction_tokens(params.jurisdiction)
+        if toks:
+            items = [it for it in items if _matches_tokens(it.get("title"), it.get("content"), it.get("url"), toks)]
+            out["filtered_count"] = len(items)
+            out["filter_tokens"] = toks[:10]
+    out["items"] = items
+    return out

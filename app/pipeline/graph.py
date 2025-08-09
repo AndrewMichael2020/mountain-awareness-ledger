@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, date as date_type
 from typing import Any, Dict, Optional, TypedDict
+import logging
 
 from langgraph.graph import StateGraph, END
 
@@ -18,6 +19,8 @@ from app.repo import (
     insert_sar_segments,
     set_event_geocode,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class IngestState(TypedDict, total=False):
@@ -44,10 +47,27 @@ def _router(state: IngestState) -> str:
 
 
 def _node_fetch(state: IngestState) -> IngestState:
-    html, final_url = fetch_url(state["url"])  # type: ignore[index]
-    state["html"] = html
-    state["final_url"] = final_url
-    return state
+    try:
+        html, final_url = fetch_url(state["url"])  # type: ignore[index]
+        state["html"] = html or ""
+        state["final_url"] = final_url or state.get("url")
+        return state
+    except PermissionError:
+        # Respect robots.txt: do not raise, do not retry; short-circuit pipeline
+        logger.warning("ingest.fetch: blocked by robots.txt url=%s", state.get("url"))
+        state["html"] = ""
+        state["final_url"] = state.get("url")
+        state["error"] = "robots_blocked"
+        state["skip"] = True
+        return state
+    except Exception as ex:
+        # On other hard fetch errors, also avoid retries for now
+        logger.error("ingest.fetch: failed url=%s err=%s", state.get("url"), ex)
+        state["html"] = ""
+        state["final_url"] = state.get("url")
+        state["error"] = str(ex)
+        state["skip"] = True
+        return state
 
 
 def _node_dup_check(db, state: IngestState) -> IngestState:
@@ -64,6 +84,8 @@ def _node_dup_check(db, state: IngestState) -> IngestState:
 
 
 def _node_clean(state: IngestState) -> IngestState:
+    if state.get("skip"):
+        return state
     text_body, meta = clean_html(state.get("html") or "", state.get("final_url"))
     state["text_body"] = text_body
     state["meta"] = meta or {}
@@ -77,6 +99,8 @@ def _node_clean(state: IngestState) -> IngestState:
 
 
 def _node_extract(state: IngestState) -> IngestState:
+    if state.get("skip"):
+        return state
     dt = state.get("pub_date")
     published = datetime.combine(dt, datetime.min.time()) if dt else None
     state["extracted"] = extract_core_fields(state.get("text_body") or "", published)
@@ -159,6 +183,9 @@ def run_ingest_graph_url(db, url: str, publisher: Optional[str] = None, article_
     }
     app = build_ingest_graph(db)
     out = app.invoke(state)
+    # If fetch step marked this as skipped, return a concise result
+    if isinstance(out, dict) and out.get("skip"):
+        return {"status": "skipped", "url": out.get("final_url") or url, "reason": out.get("error")}
     return {"status": out.get("status"), "event_id": out.get("event_id"), "source_id": out.get("source_id")}
 
 
