@@ -1,0 +1,12 @@
+{
+  "query": "(climber OR mountaineer OR hiker OR skier) AND (died OR fatal OR killed OR avalanche) AND (British Columbia OR BC)",
+  "search_depth": "advanced",
+  "max_results": 20,
+  "time_range": "year",
+  "include_answer": "advanced",
+  "include_raw_content": "text",
+  "country": "canada",
+  "include_domains": [
+    "cbc.ca", "globalnews.ca", "squamishchief.com", "avalanche.ca", "gripped.com", "vancouversun.com", "theprovince.com", "northshorerescue.com", "squamishsar.org", "gofundme.com"
+  ]
+}

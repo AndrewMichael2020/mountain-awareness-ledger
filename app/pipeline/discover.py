@@ -144,13 +144,18 @@ def tavily_search(
         logger.warning("tavily_search: missing TAVILY_API_KEY; returning empty list")
         return []
     url = os.environ.get("TAVILY_API_URL", "https://api.tavily.com/search")
-    auth_style = os.environ.get("TAVILY_AUTH_STYLE", "header").lower()  # header | bearer | body
+    # auth style: auto tries bearer then header, else body
+    auth_style = os.environ.get("TAVILY_AUTH_STYLE", "auto").lower()  # auto | header | bearer | body
 
     # Normalize max_results (Tavily caps at 20)
     try:
-        mr = int(max_results) if max_results is not None else 10
+        mr_env = int(os.environ.get("TAVILY_MAX_RESULTS", "0"))
     except Exception:
-        mr = 10
+        mr_env = 0
+    try:
+        mr = int(max_results) if max_results is not None else (mr_env if mr_env > 0 else 8)
+    except Exception:
+        mr = 8
     mr = max(1, min(mr, 20))
 
     # Choose time_range; if explicit start/end present, omit time_range and use custom dates
@@ -171,9 +176,12 @@ def tavily_search(
         "query": query,
         "search_depth": "advanced",
         "max_results": mr,
-        "include_answer": "advanced",
-        "include_raw_content": "text",
     }
+    # keep payload minimal; optionally include raw via env opt-in
+    if os.environ.get("TAVILY_INCLUDE_ANSWER", "false").strip().lower() in {"1","true","yes"}:
+        payload["include_answer"] = "advanced"
+    if os.environ.get("TAVILY_INCLUDE_RAW", "false").strip().lower() in {"1","true","yes"}:
+        payload["include_raw_content"] = "text"
     if country:
         payload["country"] = country
     if include_domains:
@@ -187,36 +195,67 @@ def tavily_search(
     else:
         payload["time_range"] = time_range
 
-    headers = {"Content-Type": "application/json"}
-    if auth_style == "bearer":
-        headers["Authorization"] = f"Bearer {api_key}"
-    elif auth_style == "header":
-        headers["x-api-key"] = api_key
-    elif auth_style == "body":
-        payload["api_key"] = api_key
+    headers = {"Content-Type": "application/json", "User-Agent": os.environ.get("HTTP_USER_AGENT", "alpine-ledger/0.1")}
+
+    def _apply_auth(style: str) -> dict:
+        h = dict(headers)
+        if style == "bearer":
+            h["Authorization"] = f"Bearer {api_key}"
+        elif style == "header":
+            h["x-api-key"] = api_key
+        return h
 
     logger.info("tavily_http: POST %s auth_style=%s payload_keys=%s", url, auth_style, list(payload.keys()))
-    timeout = float(os.environ.get("TAVILY_TIMEOUT", "20"))
-    retries = int(os.environ.get("TAVILY_RETRIES", "2"))
+    timeout = float(os.environ.get("TAVILY_TIMEOUT", "12"))
+    retries = int(os.environ.get("TAVILY_RETRIES", "1"))
     backoff = float(os.environ.get("TAVILY_BACKOFF", "2"))
-    for attempt in range(retries + 1):
+
+    def _do_request(hdrs: dict) -> tuple[int, dict | None, str | None]:
         try:
-            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
-            if r.status_code != 200:
+            r = requests.post(url, headers=hdrs, data=json.dumps(payload), timeout=timeout)
+            status = getattr(r, "status_code", 0)
+            if status != 200:
                 body = r.text[:300].replace("\n", " ") if hasattr(r, "text") else ""
-                logger.error("tavily_http: status=%s attempt=%d/%d error_body=%s", r.status_code, attempt + 1, retries + 1, body)
-                if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                    time.sleep(backoff * (attempt + 1))
-                    continue
-                return []
-            data = r.json() if hasattr(r, "json") else {}
-            break
+                return status, None, body
+            return 200, (r.json() if hasattr(r, "json") else {}), None
         except Exception as ex:
-            logger.exception("tavily_http: request failed (attempt %d/%d): %s", attempt + 1, retries + 1, ex)
-            if attempt < retries:
+            return -1, None, str(ex)
+
+    # Determine auth attempt order
+    auth_order: list[str]
+    if auth_style == "auto":
+        auth_order = ["bearer", "header", "body"]
+    else:
+        auth_order = [auth_style]
+
+    last_err = None
+    data = None
+    for style in auth_order:
+        h = _apply_auth(style) if style != "body" else headers
+        pl = dict(payload)
+        if style == "body":
+            pl["api_key"] = api_key
+        for attempt in range(retries + 1):
+            status, d, err = _do_request(h)
+            if status == 200 and d is not None:
+                data = d
+                break
+            # 401/403 -> try next auth style immediately
+            if status in (401, 403):
+                logger.warning("tavily_http: auth style %s rejected with %s; trying next if available", style, status)
+                break
+            # transient -> backoff
+            if status in (429, 500, 502, 503, 504) and attempt < retries:
                 time.sleep(backoff * (attempt + 1))
                 continue
-            return []
+            last_err = f"status={status} err={err}"
+            break
+        if data is not None:
+            break
+    if data is None:
+        if last_err:
+            logger.error("tavily_http: failed all auth attempts: %s", last_err)
+        return []
 
     items = data.get("results", [])
     logger.info("tavily_http: got %d results", len(items))
@@ -291,6 +330,13 @@ def _matches_tokens(title: str | None, content: str | None, url: str | None, tok
 def run_discovery(params: SearchParams) -> dict:
     cfg = _load_yaml()
     queries = build_queries(params)
+    # Avoid stressing Tavily: optionally cap queries via env
+    try:
+        max_q = int(os.environ.get("TAVILY_MAX_QUERIES", "0"))
+    except Exception:
+        max_q = 0
+    if max_q and max_q > 0:
+        queries = queries[:max_q]
     days_back = params.years * 365
     start_iso, end_iso = _date_range_from_years(params.years)
     country = _country_for_juris(params.jurisdiction)

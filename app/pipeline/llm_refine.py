@@ -236,48 +236,143 @@ def refine_with_llm(cleaned_text: str, pubmeta: Dict[str, Any], current_event: O
     return payload
 
 
-def merge_event_fields(deterministic: Dict[str, Any], refined: ExtractionPayload) -> Dict[str, Any]:
-    """Use only LLM-derived values for event fields; keep publication metadata deterministic elsewhere."""
+def merge_event_fields(current: Dict[str, Any], refined: ExtractionPayload) -> Dict[str, Any]:
+    """Merge current event fields with LLM output.
 
-    def only_refined(ref_val, sanitizer=lambda x: x):
-        if ref_val is not None and ref_val != "" and ref_val != []:
-            return sanitizer(ref_val)
+    Rules:
+    - Do not delete existing fields. Only update when LLM provides a non-empty value.
+    - Pubmeta remains deterministic elsewhere (not touched here).
+    - LLM may override existing values if it has a non-empty replacement.
+    - Skip keys where the LLM value is None/empty to avoid wiping DB fields.
+    """
+
+    def _non_empty(val):
+        if val is None:
+            return False
+        if isinstance(val, str):
+            return val.strip() != ""
+        if isinstance(val, (list, tuple, set, dict)):
+            return len(val) > 0
+        return True
+
+    def _pick(value, sanitizer=lambda x: x):
+        if _non_empty(value):
+            try:
+                return sanitizer(value)
+            except Exception:
+                return value
         return None
 
-    merged: Dict[str, Any] = {
-        # core event fields (LLM authoritative)
-        "jurisdiction": only_refined(refined.jurisdiction),
-        "location_name": only_refined(refined.location_name, _sanitize_place),
-        "peak_name": only_refined(refined.peak_name, _sanitize_place),
-        "route_name": only_refined(getattr(refined, "route_name", None), _sanitize_place),
-        "activity": only_refined(refined.activity),
-        "cause_primary": only_refined(refined.cause_primary),
-        "contributing_factors": only_refined(refined.contributing_factors or None) or None,
-        "n_fatalities": only_refined(refined.n_fatalities),
-        "n_injured": only_refined(getattr(refined, "n_injured", None)),
-        "party_size": only_refined(getattr(refined, "party_size", None)),
-        "date_event_start": only_refined(refined.date_event_start),
-        "date_event_end": only_refined(refined.date_event_end),
-        "date_of_death": only_refined(refined.date_of_death),
-        # categorized names
-        "names_all": only_refined(refined.names_all or None),
-        "names_deceased": only_refined(refined.names_deceased or None),
-        "names_relatives": only_refined(refined.names_relatives or None),
-        "names_responders": only_refined(refined.names_responders or None),
-        "names_spokespersons": only_refined(refined.names_spokespersons or None),
-        "names_medics": only_refined(refined.names_medics or None),
-        # source annotations (kept for audit on sources)
-        "summary_bullets": refined.summary_bullets or None,
-        "quoted_evidence": {
-            "cause_primary": next((e.get("quote") if isinstance(e, dict) else getattr(e, "quote", None) for e in (refined.evidence or []) if (isinstance(e, dict) and e.get("field") == "cause_primary") or (getattr(e, "field", None) == "cause_primary")), None),
-            "date_of_death": next((e.get("quote") if isinstance(e, dict) else getattr(e, "quote", None) for e in (refined.evidence or []) if (isinstance(e, dict) and e.get("field") == "date_of_death") or (getattr(e, "field", None) == "date_of_death")), None),
-            "n_fatalities": next((e.get("quote") if isinstance(e, dict) else getattr(e, "quote", None) for e in (refined.evidence or []) if (isinstance(e, dict) and e.get("field") == "n_fatalities") or (getattr(e, "field", None) == "n_fatalities")), None),
-            "location_name": next((e.get("quote") if isinstance(e, dict) else getattr(e, "quote", None) for e in (refined.evidence or []) if (isinstance(e, dict) and e.get("field") == "location_name") or (getattr(e, "field", None) == "location_name")), None),
-        },
-        # SAR segments
-        "sar": [s.model_dump() if hasattr(s, "model_dump") else s for s in (refined.sar or [])],
-    }
-    return merged
+    updates: Dict[str, Any] = {}
+
+    # Core event fields: take refined if non-empty
+    v = _pick(refined.jurisdiction)
+    if v is not None:
+        updates["jurisdiction"] = v
+
+    v = _pick(refined.location_name, _sanitize_place)
+    if v is not None:
+        updates["location_name"] = v
+
+    v = _pick(refined.peak_name, _sanitize_place)
+    if v is not None:
+        updates["peak_name"] = v
+
+    v = _pick(getattr(refined, "route_name", None), _sanitize_place)
+    if v is not None:
+        updates["route_name"] = v
+
+    v = _pick(refined.activity)
+    if v is not None:
+        updates["activity"] = v
+
+    v = _pick(refined.cause_primary)
+    if v is not None:
+        updates["cause_primary"] = v
+
+    v = _pick(refined.contributing_factors or None)
+    if v is not None:
+        updates["contributing_factors"] = v
+
+    v = _pick(refined.n_fatalities)
+    if v is not None:
+        updates["n_fatalities"] = v
+
+    v = _pick(getattr(refined, "n_injured", None))
+    if v is not None:
+        updates["n_injured"] = v
+
+    v = _pick(getattr(refined, "party_size", None))
+    if v is not None:
+        updates["party_size"] = v
+
+    v = _pick(refined.date_event_start)
+    if v is not None:
+        updates["date_event_start"] = v
+
+    v = _pick(refined.date_event_end)
+    if v is not None:
+        updates["date_event_end"] = v
+
+    v = _pick(refined.date_of_death)
+    if v is not None:
+        updates["date_of_death"] = v
+
+    # Names lists
+    for key in (
+        "names_all",
+        "names_deceased",
+        "names_relatives",
+        "names_responders",
+        "names_spokespersons",
+        "names_medics",
+    ):
+        v = _pick(getattr(refined, key, None))
+        if v is not None:
+            updates[key] = v
+
+    # Optional lat/lon if provided by LLM
+    v = _pick(getattr(refined, "lat", None))
+    if v is not None:
+        updates["lat"] = v
+    v = _pick(getattr(refined, "lon", None))
+    if v is not None:
+        updates["lon"] = v
+
+    # Source annotations (only if provided)
+    if _non_empty(refined.summary_bullets):
+        updates["summary_bullets"] = refined.summary_bullets
+
+    # Extract selected evidence quotes if present
+    if _non_empty(refined.evidence):
+        def _q(field_name: str) -> Optional[str]:
+            for e in refined.evidence:
+                try:
+                    if isinstance(e, dict):
+                        if e.get("field") == field_name and _non_empty(e.get("quote")):
+                            return e.get("quote")
+                    else:
+                        if getattr(e, "field", None) == field_name and _non_empty(getattr(e, "quote", None)):
+                            return getattr(e, "quote", None)
+                except Exception:
+                    continue
+            return None
+        qe = {
+            "cause_primary": _q("cause_primary"),
+            "date_of_death": _q("date_of_death"),
+            "n_fatalities": _q("n_fatalities"),
+            "location_name": _q("location_name"),
+        }
+        # Only include if any quotes present
+        if any(_non_empty(v) for v in qe.values()):
+            updates["quoted_evidence"] = qe
+
+    # SAR segments (replace only if provided)
+    if _non_empty(refined.sar):
+        sar_dumped = [s.model_dump() if hasattr(s, "model_dump") else s for s in refined.sar]
+        updates["sar"] = sar_dumped
+
+    return updates
 
 
 from typing import Any, Dict

@@ -16,8 +16,8 @@ for J in $JURS; do
   echo "=== Jurisdiction: $J ==="
   echo "> Discover $J"
   curl -s -X POST "$API_URL/discover?jurisdiction=$J&years=$YEARS&mode=$MODE&strict=$STRICT&max_results_per_query=$MAX_PER_QUERY" \
-    | jq -r '.items[].url' \
-    | grep -Ev "$EXCLUDE_PATTERN" \
+    | jq -r '.items[]? | .url // empty' \
+    | { grep -Ev "$EXCLUDE_PATTERN" || true; } \
     | sort -u \
     | jq -Rs 'split("\n") | map(select(length>0)) | {urls: .}' > "payload.$J.json"
 

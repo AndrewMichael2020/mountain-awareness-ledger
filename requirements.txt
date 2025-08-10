@@ -31,3 +31,6 @@ geoalchemy2
 
 # OpenAI SDK
 openai>=1.40.0
+
+# Tavily official client
+tavily-python>=0.5.0
